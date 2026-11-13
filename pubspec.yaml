@@ -45,6 +45,30 @@ dependencies:
   http: ^1.6.0
   http_parser: ^4.1.2
 
+  # On-device panorama stitching for the 26-target AR capture, ported from the
+  # FYP OpenCV pipeline. The 360° preview stitches locally; nothing is uploaded.
+  opencv_dart: ^2.2.2
+
+# Native asset build options for dartcv4 (opencv_dart). The stitching
+# module (plus its OpenCV dependencies) is required by the 360° panorama
+# pipeline; without it Stitcher has no native implementation.
+hooks:
+  user_defines:
+    dartcv4:
+      parallel_jobs: 4
+      windows:
+        generator: Ninja
+      include_modules:
+        - stitching
+        - features2d
+        - flann
+        - calib3d
+        # `cv.imread` / `imwriteAsync` / `imdecode` are imgcodecs bindings.
+        # Stitching alone does not pull them into the bundled native library;
+        # without this entry the on-device panorama fails with
+        # "undefined symbol: cv_imread".
+        - imgcodecs
+
 dependency_overrides:
   permission_handler_android: ^13.0.1
 

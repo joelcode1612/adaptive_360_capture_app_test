@@ -85,6 +85,7 @@ class Harness {
     Vec3 position = Vec3.zero,
     Quat orientation = Quat.identity,
     TrackingState tracking = TrackingState.tracking,
+    int planesTracked = 3,
     ({Vec3 position, Quat orientation, TrackingState tracking})?
     activeAnchorPose,
     String? reportedActiveAnchorId,
@@ -96,6 +97,7 @@ class Harness {
       position: position,
       worldOrientation: orientation,
       tracking: tracking,
+      planesTracked: planesTracked,
       activeAnchorPose: activeAnchorPose,
       reportedActiveAnchorId: reportedActiveAnchorId,
       includeActiveAnchorPose: includeActiveAnchorPose,
@@ -118,6 +120,7 @@ class Harness {
     int count = 14,
     Duration step = const Duration(milliseconds: 60),
     TrackingState tracking = TrackingState.tracking,
+    int planesTracked = 3,
     bool includeActiveAnchorPose = true,
   }) async {
     final at = position ?? Vec3.zero;
@@ -127,6 +130,7 @@ class Harness {
         position: at,
         orientation: aim,
         tracking: tracking,
+        planesTracked: planesTracked,
         includeActiveAnchorPose: includeActiveAnchorPose,
         advance: step,
       );
@@ -271,6 +275,12 @@ void main() {
     },
   );
 
+  test('26-target startup explicitly disables plane finding', () async {
+    final harness = await bootHarness();
+    expect(harness.gateway.lastStartPlanes, isFalse);
+    expect(harness.gateway.startCalls, 1);
+  });
+
   group('station calibration', () {
     test('refuses to calibrate while AR is not tracking', () async {
       final harness = await bootHarness();
@@ -280,9 +290,10 @@ void main() {
       expect(harness.controller.state.message, contains('not tracking'));
     });
 
-    test('records the camera pose as the reference pose', () async {
+    test('records a fresh tracked camera pose as the reference pose', () async {
       final harness = await bootHarness();
       await harness.emit(position: const Vec3(1, 1.6, -2));
+      expect(harness.controller.calibrationReadiness.isReady, isTrue);
       await harness.controller.calibrateStation(stationId: 's1');
       final station = harness.controller.state.station;
       expect(station, isNotNull);
@@ -291,6 +302,42 @@ void main() {
       expect(station.total, kCaptureTargetCount);
       expect(station.trackingStatus, TrackingState.tracking);
     });
+
+    test(
+      'stale or heading-invalid camera pose cannot establish the station',
+      () async {
+        final harness = await bootHarness();
+        await harness.emit();
+        harness.now = harness.now.add(const Duration(milliseconds: 300));
+        expect(harness.controller.calibrationReadiness.isReady, isFalse);
+        expect(
+          harness.controller.calibrationReadiness.reason,
+          contains('stale'),
+        );
+        expect(
+          await harness.controller.calibrateStation(stationId: 's1'),
+          isFalse,
+        );
+        expect(harness.gateway.anchorCreations, 0);
+
+        // A new measured pose restores freshness, but a vertical optical axis
+        // cannot define a horizontal station heading and must still be refused.
+        await harness.emit(
+          orientation: Quat.fromYawPitch(0, 90),
+          advance: Duration.zero,
+        );
+        expect(harness.controller.calibrationReadiness.isReady, isFalse);
+        expect(
+          harness.controller.calibrationReadiness.reason,
+          contains('horizontal'),
+        );
+        expect(
+          await harness.controller.calibrateStation(stationId: 's1'),
+          isFalse,
+        );
+        expect(harness.gateway.anchorCreations, 0);
+      },
+    );
 
     test('creates all 26 targets, none captured', () async {
       final harness = await calibratedHarness();
@@ -303,6 +350,33 @@ void main() {
         isTrue,
       );
     });
+
+    test(
+      'calibrates with zero detected planes and one shared world anchor',
+      () async {
+        final harness = await bootHarness();
+        await harness.emit(planesTracked: 0);
+
+        final calibrated = await harness.controller.calibrateStation(
+          stationId: 'markerless-zero-planes',
+        );
+
+        expect(calibrated, isTrue);
+        expect(harness.controller.state.station, isNotNull);
+        expect(harness.controller.state.targets, hasLength(26));
+        expect(harness.gateway.anchorCreations, 1);
+        expect(harness.gateway.anchors, hasLength(1));
+        expect(harness.gateway.lastAnchorTrackableKey, isNull);
+        expect(
+          harness.controller.state.targets
+              .map((CaptureTarget target) => target.anchorIdentifier)
+              .toSet(),
+          hasLength(1),
+        );
+        expect(harness.gateway.raycastCalls, 0);
+        expect(harness.gateway.probeCalls, 0);
+      },
+    );
   });
 
   // ── required case 10 ──────────────────────────────────────────────────
@@ -317,9 +391,19 @@ void main() {
     expect(target.anchorWorldPosition, isNotNull);
     expect(target.anchorSurfaceType, 'WORLD');
     expect(harness.controller.state.activeAnchored, isTrue);
-    // The point of the test: no raycast was asked for during placement, so
-    // an unmapped room is indistinguishable from a mapped one.
+    expect(harness.controller.state.targets, hasLength(kCaptureTargetCount));
+    expect(
+      harness.controller.state.targets
+          .map((CaptureTarget target) => target.anchorIdentifier)
+          .toSet(),
+      hasLength(1),
+    );
+    expect(harness.gateway.anchors, hasLength(1));
+    // The point of the test: calibration and readiness ask for no raycasts or
+    // informational plane probes, so a room with no mapped surfaces is no
+    // different from a mapped one.
     expect(harness.gateway.raycastCalls, 0);
+    expect(harness.gateway.probeCalls, 0);
     // The whole arrangement is in the scene: bezel + target for all 26.
     expect(harness.gateway.lastScene.length, kCaptureTargetCount * 2);
     expect(harness.controller.state.instruction, isNot('Scan this surface'));
@@ -515,6 +599,55 @@ void main() {
         CaptureTargetStatus.captured,
       );
     });
+
+    test(
+      'green hold progress and JPEG auto-capture work without planes',
+      () async {
+        final harness = await bootHarness(surfaceFound: false);
+        await harness.emit(planesTracked: 0);
+        expect(
+          await harness.controller.calibrateStation(stationId: 'markerless'),
+          isTrue,
+        );
+        await harness.controller.selectTarget(1);
+        await Harness.flush();
+
+        final stillGate = Completer<void>();
+        harness.gateway.stillGate = stillGate.future;
+        var observedFullGreenHold = false;
+        void observe() {
+          final state = harness.controller.state;
+          if (state.autoStage == AutoCaptureStage.armed &&
+              state.stabilityProgress >= 1 &&
+              state.alignmentHoldComplete &&
+              state.station != null) {
+            observedFullGreenHold = true;
+          }
+        }
+
+        harness.controller.addListener(observe);
+        await harness.emitStable(count: 24, planesTracked: 0);
+        await Harness.waitFor(() => harness.gateway.stillRequests == 1);
+        expect(observedFullGreenHold, isTrue);
+        expect(harness.gateway.probeCalls, 0);
+        expect(harness.gateway.raycastCalls, 0);
+        expect(harness.controller.state.capturing, isTrue);
+        expect(harness.repository.saveRecordCalls, 0);
+
+        stillGate.complete();
+        await Harness.waitFor(
+          () => harness.controller.state.targets.first.status.isDone,
+        );
+        harness.controller.removeListener(observe);
+        final record = (await harness.repository.loadRecords(
+          'markerless',
+        )).single;
+        expect(record.targetId, 1);
+        expect(record.imageFormat, 'jpeg');
+        expect(await readCaptureImage(record.imagePath), fakeJpeg);
+        expect(harness.controller.state.capturedCount, 1);
+      },
+    );
 
     test(
       'a single aligned frame is not enough — the pose must be steady',
@@ -713,88 +846,130 @@ void main() {
   });
 
   group('app lifecycle', () {
-    test('resuming a reused session restores the capture phase', () async {
-      final harness = await calibratedHarness();
-      expect(harness.controller.state.phase, CapturePhase.capturing);
+    test(
+      'background pause retains the session and verifies the shared anchor',
+      () async {
+        final harness = await calibratedHarness();
+        await harness.controller.selectTarget(1);
+        await Harness.flush();
+        final targetIds = harness.controller.state.targets
+            .map((CaptureTarget target) => target.targetId)
+            .toList();
+        final sharedAnchor =
+            harness.controller.state.targets.first.anchorIdentifier;
+        final startsBeforePause = harness.gateway.startCalls;
 
-      // Same AR session, same world origin — the station is still valid.
-      harness.gateway.reusedSession = true;
-      await harness.controller.onAppResumed(width: 720, height: 1280);
-      await Harness.flush();
+        await harness.controller.onAppPaused();
+        expect(harness.gateway.pauseCalls, 1);
+        expect(harness.gateway.stopCalls, 0);
+        expect(harness.gateway.anchorCreations, 1);
+        expect(sharedAnchor, isNotNull);
+        expect(harness.gateway.anchors.containsKey(sharedAnchor), isTrue);
+        expect(harness.controller.state.station, isNotNull);
+        expect(harness.controller.state.trackingRecovering, isTrue);
 
-      expect(harness.controller.state.phase, CapturePhase.capturing);
-      expect(harness.controller.state.station, isNotNull);
-      expect(harness.controller.state.textureId, isNotNull);
-      // And the shutter is not blocked by a stale "still starting".
-      expect(
-        harness.controller.state.captureBlockReason,
-        isNot(contains('still starting')),
-      );
-    });
+        await harness.controller.onAppResumed(width: 720, height: 1280);
+        expect(harness.gateway.resumeCalls, 1);
+        expect(harness.gateway.startCalls, startsBeforePause);
+        expect(harness.controller.state.station, isNotNull);
+        expect(
+          harness.controller.state.targets
+              .map((CaptureTarget target) => target.targetId)
+              .toList(),
+          targetIds,
+        );
+        expect(harness.controller.state.trackingRecovering, isTrue);
+        expect(harness.controller.state.readyToCapture, isFalse);
 
-    test('resuming a restarted session asks for recalibration', () async {
-      final harness = await calibratedHarness();
-      expect(harness.controller.state.station, isNotNull);
+        // Fresh TRACKING camera and same tracked shared anchor must remain stable
+        // for the independent recovery hold before guidance/capture can resume.
+        await harness.emitStable(count: 16, planesTracked: 0);
+        expect(harness.controller.state.trackingRecovering, isFalse);
+        expect(harness.controller.state.station, isNotNull);
+        expect(harness.gateway.anchorCreations, 1);
+        expect(harness.gateway.stillRequests, 0);
+      },
+    );
 
-      // A fresh session has a new ARCore world origin; the old station pose
-      // would aim every target at the wrong place.
-      harness.gateway.reusedSession = false;
-      await harness.controller.onAppResumed(width: 720, height: 1280);
-      await Harness.flush();
+    test(
+      'an explicit new-session retry retains saved JPEGs for recalibration',
+      () async {
+        final harness = await calibratedHarness();
+        await harness.controller.selectTarget(1);
+        await harness.holdForAutomaticShutter();
+        final savedPath = harness.controller.state.targets.first.imagePath!;
+        final savedBytes = await readCaptureImage(savedPath);
+        expect(savedBytes, isNotNull);
 
-      expect(harness.controller.state.station, isNull);
-      expect(harness.controller.state.targets, isEmpty);
-      expect(harness.controller.state.message, contains('new world origin'));
-    });
+        await harness.controller.retrySession();
+        await Harness.flush();
+
+        expect(harness.gateway.stopCalls, 1);
+        expect(harness.gateway.startCalls, 2);
+        expect(harness.controller.state.station, isNull);
+        expect(harness.controller.state.targets, isEmpty);
+        expect(await readCaptureImage(savedPath), savedBytes);
+        expect((await harness.repository.loadRecords('s1')).single.targetId, 1);
+        expect(harness.controller.resumableStationId, 's1');
+      },
+    );
 
     test(
       'a second boot does not leave two pose subscriptions running',
       () async {
         final harness = await calibratedHarness();
+        await harness.controller.onAppPaused();
         await harness.controller.onAppResumed(width: 720, height: 1280);
         await Harness.flush();
 
+        expect(harness.gateway.startCalls, 1);
+        expect(harness.gateway.resumeCalls, 1);
         // One pose sample must advance the stability clock once, not twice: with
         // two listeners the shutter could fire twice for one target.
         await harness.controller.selectTarget(1);
-        await harness.emitStable(count: 20);
+        await harness.emitStable(count: 36);
         await Harness.flush();
         expect(harness.gateway.stillRequests, lessThanOrEqualTo(1));
       },
     );
 
     test(
-      'a failed second boot reports the thrown failure and stays inert',
+      'a failed resume keeps capture blocked and can retry the same session',
       () async {
         final harness = await calibratedHarness();
-        expect(harness.controller.state.phase, CapturePhase.capturing);
-
-        // The second boot is the pause/resume path. This resume's start fails
-        // the way a real broken session start does: a thrown failure, not a
-        // silently absent session.
-        harness.gateway.startError = const ArCoreFailure(
-          'Fake: ARCore session could not start.',
+        final station = harness.controller.state.station;
+        final targetIds = harness.controller.state.targets
+            .map((CaptureTarget target) => target.targetId)
+            .toList();
+        harness.gateway.resumeError = const ArCoreFailure(
+          'Fake: camera could not reopen.',
         );
+
         await harness.controller.onAppPaused();
         await harness.controller.onAppResumed(width: 720, height: 1280);
         await Harness.flush();
 
-        expect(harness.gateway.startCalls, 2);
-        expect(harness.controller.state.phase, CapturePhase.unavailable);
-        // The sentence survives verbatim — it is what the user reads.
+        expect(harness.gateway.startCalls, 1);
+        expect(harness.gateway.stopCalls, 0);
+        expect(harness.controller.state.station, station);
         expect(
-          harness.controller.state.message,
-          'Fake: ARCore session could not start.',
+          harness.controller.state.targets.map((t) => t.targetId),
+          targetIds,
         );
+        expect(harness.controller.state.trackingRecovering, isTrue);
+        expect(harness.controller.state.readyToCapture, isFalse);
+        expect(harness.controller.state.message, contains('could not reopen'));
 
-        // The failed boot cancelled both subscriptions *before* the start
-        // threw, and the catch path never re-subscribes them. So the event
-        // stream has no listeners and a frame arriving late goes nowhere: no
-        // ghost pose evaluations can touch state after the failure.
-        final frozen = harness.controller.state;
-        await harness.emit(advance: const Duration(milliseconds: 16));
+        // A later lifecycle resume retries `resume()` on the retained session;
+        // it does not start a new world or discard the saved station.
+        harness.gateway.resumeError = null;
+        await harness.controller.onAppResumed(width: 720, height: 1280);
         await Harness.flush();
-        expect(identical(harness.controller.state, frozen), isTrue);
+        expect(harness.gateway.resumeCalls, 2);
+        expect(harness.gateway.startCalls, 1);
+        expect(harness.controller.state.station, station);
+        expect(harness.controller.state.trackingRecovering, isTrue);
+        expect(harness.gateway.stillRequests, 0);
       },
     );
 
@@ -857,6 +1032,69 @@ void main() {
       write.complete();
       await Harness.flush();
     });
+  });
+
+  group('tracking-reference loss', () {
+    test(
+      'accepted JPEGs and target IDs survive loss and re-establishment',
+      () async {
+        final harness = await calibratedHarness();
+        await harness.controller.selectTarget(1);
+        await harness.holdForAutomaticShutter();
+        final firstPath = harness.controller.state.targets.first.imagePath!;
+        final firstBytes = await readCaptureImage(firstPath);
+        final targetIds = harness.controller.state.targets
+            .map((CaptureTarget target) => target.targetId)
+            .toList();
+
+        await harness.controller.selectTarget(2);
+        await Harness.flush();
+        final oldAnchorId =
+            harness.controller.state.targets[1].anchorIdentifier!;
+        harness.gateway.dropAnchor(oldAnchorId);
+        await harness.emit(advance: const Duration(milliseconds: 600));
+        await Harness.waitFor(
+          () => harness.controller.requiresReferenceReestablishment,
+        );
+
+        expect(harness.controller.state.station?.stationId, 's1');
+        expect(harness.controller.requiresReferenceReestablishment, isTrue);
+        expect(harness.controller.state.targets, hasLength(26));
+        expect(
+          harness.controller.state.targets.map((t) => t.targetId),
+          targetIds,
+        );
+        expect(harness.controller.state.capturedCount, 1);
+        expect(harness.controller.state.targets.first.imagePath, firstPath);
+        expect(await readCaptureImage(firstPath), firstBytes);
+        expect(harness.controller.state.readyToCapture, isFalse);
+
+        // A fresh tracked camera pose is required to place a new single shared
+        // anchor. The accepted target remains accepted and is not photographed
+        // again when the remaining work resumes.
+        await harness.emit();
+        expect(await harness.controller.recalibrateAndContinue('s1'), isTrue);
+        expect(harness.controller.state.station?.stationId, 's1');
+        expect(harness.controller.state.targets, hasLength(26));
+        expect(harness.controller.state.capturedCount, 1);
+        expect(
+          harness.controller.state.targets.first.status,
+          CaptureTargetStatus.captured,
+        );
+        expect(harness.controller.state.targets.first.imagePath, firstPath);
+        expect(harness.controller.requiresReferenceReestablishment, isFalse);
+        expect(harness.gateway.anchorCreations, 2);
+        expect(harness.gateway.anchors, hasLength(1));
+        expect(
+          harness.controller.state.targets
+              .map((CaptureTarget target) => target.anchorIdentifier)
+              .toSet(),
+          hasLength(1),
+        );
+        expect((await harness.repository.loadRecords('s1')).single.targetId, 1);
+        expect(await readCaptureImage(firstPath), firstBytes);
+      },
+    );
   });
 
   group('scan again', () {
@@ -1128,13 +1366,22 @@ void main() {
     });
   });
 
-  // ── probing the room after calibration ─────────────────────────────────
-  group('direction probe', () {
-    test('calibration probes all 26 directions', () async {
-      final harness = await calibratedHarness();
-      expect(harness.gateway.probeCalls, greaterThanOrEqualTo(1));
-      expect(harness.controller.state.probes.length, kCaptureTargetCount);
-    });
+  // Optional diagnostic bridge API retained for other AR callers. The
+  // markerless 26-target calibration path never invokes it.
+  group('optional direction probe API', () {
+    test(
+      'calibration and auto-capture do not probe target directions',
+      () async {
+        final harness = await calibratedHarness(surfaceFound: false);
+        expect(harness.gateway.probeCalls, 0);
+        expect(harness.controller.state.probes, isEmpty);
+        expect(
+          harness.controller.state.targets,
+          hasLength(kCaptureTargetCount),
+        );
+        expect(harness.controller.state.activeAnchored, isTrue);
+      },
+    );
 
     test('a probe records a surface per direction, and counts them', () async {
       final harness = await calibratedHarness();

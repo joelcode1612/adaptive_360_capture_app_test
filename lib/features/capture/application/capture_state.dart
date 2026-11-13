@@ -118,6 +118,7 @@ class CaptureState {
     this.tracking = TrackingState.initialising,
     this.trackingFailureReason,
     this.trackingRecovering = false,
+    this.anchorCount,
     this.planesTracked = 0,
     this.planeCount = 0,
     this.walls = 0,
@@ -182,6 +183,9 @@ class CaptureState {
   /// after the bounded station-reference verification has completed, then the
   /// normal 600 ms capture-stability window begins again.
   final bool trackingRecovering;
+
+  /// Native ARCore anchor count from the latest pose event; null until reported.
+  final int? anchorCount;
 
   final int planesTracked;
   final int planeCount;
@@ -381,6 +385,30 @@ class CaptureState {
   /// Whether the raw drift has crossed the station limit. The raw [driftM]
   /// value is always computed, published and enforced by both shutter paths.
   bool get stationDrifted => driftM > geometry.stationDriftWarningM;
+
+  /// A non-blocking movement advisory below the strict station-distance limit.
+  /// The 0.20 m gate remains authoritative; pivot compensation is reported
+  /// separately and never hides raw camera displacement.
+  String? get movementWarning {
+    if (tracking != TrackingState.tracking ||
+        trackingRecovering ||
+        station == null ||
+        !activeAnchorTracking) {
+      return null;
+    }
+    if (rotatingInPlace) {
+      return 'Body rotation detected: raw camera displacement '
+          '${rawStationDriftM.toStringAsFixed(2)} m; '
+          'station-relative offset ${driftM.toStringAsFixed(2)} m. '
+          'The capture gate still checks the measured offset.';
+    }
+    if (driftM > 0.05 && !stationDrifted) {
+      return 'Camera drift is ${driftM.toStringAsFixed(2)} m. '
+          'Keep it below ${geometry.stationDriftWarningM.toStringAsFixed(2)} m '
+          'for capture quality.';
+    }
+    return null;
+  }
 
   /// Whether the station-distance warning is being presented.
   ///
@@ -923,6 +951,7 @@ class CaptureState {
     TrackingState? tracking,
     String? trackingFailureReason,
     bool? trackingRecovering,
+    int? anchorCount,
     int? planesTracked,
     int? planeCount,
     int? walls,
@@ -980,6 +1009,7 @@ class CaptureState {
     tracking: tracking ?? this.tracking,
     trackingFailureReason: trackingFailureReason ?? this.trackingFailureReason,
     trackingRecovering: trackingRecovering ?? this.trackingRecovering,
+    anchorCount: anchorCount ?? this.anchorCount,
     planesTracked: planesTracked ?? this.planesTracked,
     planeCount: planeCount ?? this.planeCount,
     walls: walls ?? this.walls,

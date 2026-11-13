@@ -1,46 +1,32 @@
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
-import 'package:adaptive_360_capture_app/features/virtual_tour/platform/arcore_ar.dart';
 
-/// What actually happened to one target.
+/// The state of one target in the markerless 26-target capture flow.
 ///
-/// Four states, because they need four different actions from the user. A target
-/// that was never attempted because no surface was found is *not* a failure —
-/// telling the user it failed would send them looking for a bug instead of
-/// pointing the phone at a wall.
+/// Surface probes are not a readiness input. Every target is computed from the
+/// calibrated station frame and shares the same world-space anchor.
 enum TargetVerdict {
-  /// A photograph is on disk and recorded.
+  /// A photograph was accepted and recorded.
   saved,
 
-  /// An attempt was made and it failed. Re-takeable.
+  /// A capture attempt failed and may be retried.
   failed,
 
-  /// Probed, and there is no surface along this direction.
-  noSurface,
+  /// The AR world reference is unavailable or this target has no placement.
+  referenceLost,
 
-  /// Never probed — the station has not been calibrated, or the scan has not
-  /// run. Distinct from [noSurface] because "I have not looked" and "I looked
-  /// and there is nothing" call for different actions.
-  unscanned,
-
-  /// Anchored, nothing attempted, not the current target.
+  /// Placed below the shared station anchor, but not selected.
   ready,
 
   /// The target currently being guided towards.
   active;
 
-  /// Whether this target can be captured without changing the environment.
   bool get isActionable => this == ready || this == active;
 }
 
-/// The verdict for [target], plus the one line of detail that explains it.
-///
-/// Pure, so the four branches can be tested without a widget tree — which
-/// matters because the difference between [TargetVerdict.failed] and
-/// [TargetVerdict.noSurface] is the difference between "report a bug" and "move
-/// the phone".
+/// The target's capture state, independent of any physical surface detection.
 ({TargetVerdict verdict, String? detail}) targetVerdict(
   CaptureTarget target, {
-  SurfaceProbe? probe,
+  required bool referenceAvailable,
 }) {
   if (target.status.isDone) {
     final file = target.imagePath;
@@ -52,42 +38,19 @@ enum TargetVerdict {
   if (target.status == CaptureTargetStatus.failed) {
     return (
       verdict: TargetVerdict.failed,
-      detail: target.message ?? 'No reason recorded.',
+      detail: target.message ?? 'Capture failed; re-aim and retry.',
     );
   }
-  final isActive = target.status == CaptureTargetStatus.active;
-
-  if (target.isAnchored) {
-    final surface = target.anchorSurfaceType == null
-        ? 'anchored'
-        : 'anchored · ${target.anchorSurfaceType}';
+  if (!referenceAvailable || !target.isAnchored) {
     return (
-      verdict: isActive ? TargetVerdict.active : TargetVerdict.ready,
-      detail: surface,
+      verdict: TargetVerdict.referenceLost,
+      detail: 'Waiting for a verified shared station reference.',
     );
   }
-
-  // Not anchored. The probe decides whether that is "nothing there" or "not
-  // looked yet" — and a surface that was found is still actionable, because
-  // selecting the target will anchor to it.
-  if (probe == null) {
-    return (
-      verdict: TargetVerdict.unscanned,
-      detail: target.message ?? 'Not scanned yet — scan all directions.',
-    );
-  }
-  if (!probe.found) {
-    return (
-      verdict: TargetVerdict.noSurface,
-      detail:
-          target.message ??
-          'No surface along this direction. Point at that part of the room '
-              'and re-scan all directions.',
-    );
-  }
+  final active = target.status == CaptureTargetStatus.active;
   return (
-    verdict: isActive ? TargetVerdict.active : TargetVerdict.ready,
-    detail: 'surface found · ${probe.describe}',
+    verdict: active ? TargetVerdict.active : TargetVerdict.ready,
+    detail: 'Computed from the station-local target geometry.',
   );
 }
 

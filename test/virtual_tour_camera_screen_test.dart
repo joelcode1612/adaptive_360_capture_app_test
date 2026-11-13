@@ -253,6 +253,7 @@ void main() {
     final harness = await pumpScreen(tester);
 
     expect(harness.gateway.startCalls, 1);
+    expect(harness.gateway.lastStartPlanes, isFalse);
     expect(harness.gateway.stopCalls, 0);
     expect(find.byType(Texture), findsOneWidget);
     expect(find.text('0 / 30 captured'), findsOneWidget);

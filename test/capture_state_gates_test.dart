@@ -68,6 +68,18 @@ void main() {
       },
     );
 
+    test('zero detected planes do not block target readiness', () {
+      final state = _base(alignment: _aligned()).copyWith(
+        planesTracked: 0,
+        planeCount: 0,
+        alignedHeldMs: 600,
+        stable: true,
+      );
+      expect(state.captureBlockReasonBeforeSettle, isNull);
+      expect(state.readyToCapture, isTrue);
+      expect(state.captureBlockReason, isNull);
+    });
+
     test('a misaligned frame blocks with the alignment instruction', () {
       final state = _base(alignment: _offTarget());
       final reason = state.captureBlockReasonBeforeSettle;
@@ -157,6 +169,33 @@ void main() {
       );
       expect(state.captureBlockReasonBeforeSettle, 'Saving the photograph…');
     });
+  });
+
+  group('movement interpretation', () {
+    test('ordinary camera drift warns before the strict 20 cm block', () {
+      final state = _base(alignment: _aligned()).copyWith(
+        driftM: 0.10,
+        rawStationDriftM: 0.10,
+        alignedHeldMs: 600,
+        stable: true,
+      );
+      expect(state.movementWarning, contains('Camera drift is 0.10 m'));
+      expect(state.stationDrifted, isFalse);
+      expect(state.captureBlockReasonBeforeSettle, isNull);
+    });
+
+    test(
+      'verified body rotation separates raw excursion from station offset',
+      () {
+        final state = _base(
+          alignment: _aligned(),
+        ).copyWith(driftM: 0.03, rawStationDriftM: 0.65, rotatingInPlace: true);
+        expect(state.movementWarning, contains('Body rotation detected'));
+        expect(state.movementWarning, contains('0.65 m'));
+        expect(state.movementWarning, contains('0.03 m'));
+        expect(state.stationDrifted, isFalse);
+      },
+    );
   });
 
   group('progress and ring state', () {

@@ -377,9 +377,8 @@ class _CaptureBody extends StatelessWidget {
                 ),
               )
             else
-              // One line of status, expandable. Always present: "is AR
-              // tracking?" and "how many planes?" are asked before anything
-              // else works, and both are answered on the collapsed line.
+              // One line of status, expandable. Tracking and the shared
+              // station-reference state are the live capture prerequisites.
               _StatusBar(
                 controller: controller,
                 top: MediaQuery.paddingOf(context).top + 8,
@@ -536,14 +535,11 @@ Future<void> _openTargetSheet(
   builder: (BuildContext sheetContext) => _TargetSheet(controller: controller),
 );
 
-/// The 26 targets: the sphere for choosing one, and a list that says, for each,
-/// whether it works.
+/// The 26 station-local targets and their capture/reference state.
 ///
-/// The list exists because the sphere shows *where* a target is and whether it is
-/// captured, but not *why* one is not. A target can be un-capturable for three
-/// different reasons — no surface found, the save failed, or nothing attempted —
-/// and those need different actions. Each row therefore carries an explicit
-/// verdict rather than a colour to interpret.
+/// Surface detection is not part of this workflow. Each row distinguishes an
+/// accepted photo, a real capture failure, a placed target, and a target whose
+/// shared station reference must be re-established.
 class _TargetSheet extends StatelessWidget {
   const _TargetSheet({required this.controller});
 
@@ -553,18 +549,25 @@ class _TargetSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = controller.state;
     final targets = state.targets;
+    final referenceAvailable =
+        state.station != null &&
+        !controller.requiresReferenceReestablishment &&
+        !state.trackingRecovering &&
+        state.tracking == TrackingState.tracking;
 
-    final ready = targets
-        .where(
-          (CaptureTarget t) =>
-              !t.status.isDone &&
-              targetVerdict(
-                t,
-                probe: state.probes[t.targetId],
-              ).verdict.isActionable,
-        )
+    final ready = !referenceAvailable
+        ? 0
+        : targets
+              .where(
+                (CaptureTarget t) =>
+                    !t.status.isDone &&
+                    t.status != CaptureTargetStatus.failed &&
+                    t.isAnchored,
+              )
+              .length;
+    final failed = targets
+        .where((CaptureTarget t) => t.status == CaptureTargetStatus.failed)
         .length;
-    final blocked = targets.length - state.capturedCount - ready;
 
     return SafeArea(
       child: ConstrainedBox(
@@ -590,7 +593,7 @@ class _TargetSheet extends StatelessWidget {
                 targets.isEmpty
                     ? 'Calibrate the station to create the 26 targets.'
                     : '${state.capturedCount} of ${targets.length} saved · '
-                          '$ready with a surface · $blocked blocked',
+                          '$ready placed · $failed capture failures',
                 style: const TextStyle(
                   color: CaptureColors.mutedOnDark,
                   fontSize: 12,
@@ -621,12 +624,19 @@ class _TargetSheet extends StatelessWidget {
                   specs: controller.specs,
                 ),
                 const SizedBox(height: 8),
-                _GhostButton(
-                  label: state.probes.isEmpty
-                      ? 'Scan all directions'
-                      : 'Re-scan all directions',
-                  enabled: state.station != null,
-                  onPressed: () => controller.probeTargets(),
+                Text(
+                  !referenceAvailable
+                      ? 'The world reference needs verified re-establishment. '
+                            'Saved photographs and target IDs are retained.'
+                      : state.trackingRecovering
+                      ? 'Verifying the shared station anchor and fresh camera pose.'
+                      : 'Targets use the station-local geometry and one shared world anchor.'
+                            '${state.anchorCount == null ? '' : ' Native anchor count: ${state.anchorCount}.'}',
+                  style: const TextStyle(
+                    color: CaptureColors.mutedOnDark,
+                    fontSize: 11,
+                    height: 1.35,
+                  ),
                 ),
                 const SizedBox(height: 8),
                 const Divider(color: Color(0x22FFFFFF), height: 1),
@@ -637,7 +647,7 @@ class _TargetSheet extends StatelessWidget {
                     itemCount: targets.length,
                     itemBuilder: (BuildContext context, int i) => _TargetRow(
                       target: targets[i],
-                      probe: state.probes[targets[i].targetId],
+                      referenceAvailable: referenceAvailable,
                       // The only way back into a captured target. The
                       // controller refuses to *select* a saved one, so the
                       // list has to offer the explicit reset instead of
@@ -734,6 +744,19 @@ class _ControlPanelState extends State<_ControlPanel> {
               letterSpacing: 0.2,
             ),
           ),
+          if (state.movementWarning case final warning?) ...[
+            const SizedBox(height: 4),
+            Text(
+              warning,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: CaptureColors.warn,
+                fontSize: 11,
+                height: 1.3,
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           Row(
             children: [
@@ -793,6 +816,36 @@ class _ControlPanelState extends State<_ControlPanel> {
                 // action for a stale pose or an undefined horizontal yaw.
                 enabled: calibrationReadiness.isReady,
                 onPressed: () => controller.continueSavedStation(),
+              ),
+            ],
+          ] else if (controller.requiresReferenceReestablishment) ...[
+            const Text(
+              'The AR world reference was lost. The station, target IDs and '
+              'accepted photographs are retained; continue only after a fresh '
+              'tracked camera pose creates a new shared reference.',
+              style: TextStyle(
+                color: CaptureColors.warn,
+                fontSize: 12,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _GhostButton(
+              label: 'Re-establish reference & continue',
+              enabled: calibrationReadiness.isReady,
+              onPressed: () =>
+                  controller.recalibrateAndContinue(state.station!.stationId),
+            ),
+            if (!calibrationReadiness.isReady &&
+                calibrationReadiness.reason != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                calibrationReadiness.reason!,
+                style: const TextStyle(
+                  color: CaptureColors.warn,
+                  fontSize: 11,
+                  height: 1.3,
+                ),
               ),
             ],
           ] else ...[
@@ -855,11 +908,10 @@ class _ControlPanelState extends State<_ControlPanel> {
   }
 }
 
-/// The top "dropdown": one line of status, expandable to the full detail.
+/// The top "dropdown": one line of live AR/reference status, expandable to details.
 ///
-/// It is always present, because "is AR tracking?" and "how many planes?" are
-/// questions the user asks *before* anything else works — and on the collapsed
-/// line those two answers are already visible.
+/// It is always present so tracking, shared-anchor state and capture progress
+/// remain visible without implying that a plane or physical surface is needed.
 class _StatusBar extends StatefulWidget {
   const _StatusBar({
     required this.controller,
@@ -881,7 +933,8 @@ class _StatusBarState extends State<_StatusBar> {
   @override
   Widget build(BuildContext context) {
     final state = widget.controller.state;
-    final detail = _detailText(state);
+    final referenceLost = widget.controller.requiresReferenceReestablishment;
+    final detail = _detailText(state, referenceLost: referenceLost);
 
     return Positioned(
       left: 12,
@@ -914,7 +967,7 @@ class _StatusBarState extends State<_StatusBar> {
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        _statusLine(state),
+                        _statusLine(state, referenceLost: referenceLost),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -986,26 +1039,41 @@ Future<void> _openTargets(BuildContext context, CaptureController c) =>
 IconData _statusIcon(CaptureState state) {
   if (state.arFault != null) return Icons.error_outline;
   if (state.tracking != TrackingState.tracking) return Icons.gps_off;
-  if (state.planesTracked == 0) return Icons.grid_off;
+  if (state.trackingRecovering || !state.activeAnchorTracking) {
+    return Icons.sync_problem;
+  }
   if (state.readyToCapture) return Icons.check_circle_outline;
   return Icons.my_location;
 }
 
 Color _statusColor(CaptureState state) {
   if (state.arFault != null) return CaptureColors.danger;
-  if (state.tracking != TrackingState.tracking) return CaptureColors.warn;
-  if (state.planesTracked == 0) return CaptureColors.warn;
+  if (state.tracking != TrackingState.tracking || state.trackingRecovering) {
+    return CaptureColors.warn;
+  }
   if (state.readyToCapture) return CaptureColors.ok;
   return CaptureColors.mutedOnDark;
 }
 
-/// The one line shown when the status bar is collapsed.
-String _statusLine(CaptureState state) {
+/// The one line shown when the status bar is collapsed. It names actual
+/// tracking/reference state and never reports plane counts as capture readiness.
+String _statusLine(CaptureState state, {bool referenceLost = false}) {
   final tracking = state.tracking == TrackingState.tracking
       ? 'AR tracking OK'
       : _trackingLabel(state.tracking);
-  final rotation = state.rotatingInPlace ? ' · turning in place' : '';
-  return '$tracking · ${state.planeSummary} · '
+  final reference = referenceLost
+      ? 'world reference lost'
+      : state.station == null
+      ? 'station reference needed'
+      : state.trackingRecovering
+      ? 'verifying station reference'
+      : state.activeAnchored && state.activeAnchorTracking
+      ? 'shared anchor tracked'
+      : state.activeAnchored
+      ? 'shared anchor paused'
+      : 'station calibrated';
+  final rotation = state.rotatingInPlace ? ' · body rotation' : '';
+  return '$tracking · $reference · '
       '${state.capturedCount}/${state.totalTargets}$rotation';
 }
 
@@ -1042,7 +1110,7 @@ String _trackingLabel(TrackingState tracking) => switch (tracking) {
   TrackingState.unavailable => 'AR unavailable',
 };
 
-String _detailText(CaptureState state) {
+String _detailText(CaptureState state, {bool referenceLost = false}) {
   final target = state.activeTarget;
   final parts = <String>[];
   if (target != null) {
@@ -1051,33 +1119,80 @@ String _detailText(CaptureState state) {
       '· pitch ${target.pitchDegrees.toStringAsFixed(0)}°',
     );
   }
+
   parts.add(
-    !state.activeAnchored
-        ? 'Target not anchored'
-        // Placed is not the same as tracked, and both are drawn: a paused
-        // anchor keeps its world position and its mesh — ARCore is refining
-        // the world, not moving the marker. What a pause does cost is the
-        // shutter, which stays blocked until tracking is back.
-        : state.activeAnchorTracking
-        ? 'Placed in the AR world'
-        : 'Placed — AR is refining it',
+    '${_trackingLabel(state.tracking)}'
+    '${state.trackingFailureReason == null ? '' : ' · ${state.trackingFailureReason}'}',
   );
-  // "0 planes" alone is not actionable; the breakdown says *what* is missing.
-  parts.add('${_trackingLabel(state.tracking)} · ${state.planeSummary}');
-  // "no planes yet" reads like a blocker, and it is not one: every target is
-  // placed at a *computed* world position on a world anchor with no trackable,
-  // so an unmapped room changes nothing about placement, capture or the
-  // sphere. Saying so is cheaper than the user pointing the phone at a wall.
-  if (state.tracking == TrackingState.tracking && state.planesTracked == 0) {
-    parts.add('Planes are not needed — targets are placed from the station');
+  parts.add(
+    referenceLost
+        ? 'Station world reference unavailable · logical station, target IDs and saved photos retained'
+        : state.station == null
+        ? 'Station reference not calibrated'
+        : state.trackingRecovering
+        ? 'Verifying the existing station anchor against fresh camera poses'
+        : 'Station reference established from the calibrated camera pose',
+  );
+  parts.add(
+    state.anchorCount == null
+        ? 'Native anchor count not reported yet'
+        : 'Native ARCore anchors ${state.anchorCount}',
+  );
+  if (target != null) {
+    parts.add(
+      !state.activeAnchored
+          ? 'Selected target placement unavailable'
+          : state.activeAnchorTracking
+          ? 'Shared world anchor is tracking'
+          : 'Shared world anchor is not currently tracking',
+    );
   }
+  parts.add(
+    state.measurementFresh
+        ? 'Camera pose is fresh'
+        : 'Waiting for a fresh camera pose',
+  );
+  final alignment = state.alignment;
+  if (alignment != null && alignment.usable) {
+    parts.add(
+      'Alignment error ${alignment.angularErrorDeg.toStringAsFixed(1)}° '
+      '(limit ${state.geometry.alignmentToleranceDeg.toStringAsFixed(1)}°) · '
+      'yaw ${_signed(alignment.yawCorrectionDeg)}° · '
+      'pitch ${_signed(alignment.pitchCorrectionDeg)}°',
+    );
+  }
+  if (state.station != null) {
+    parts.add(
+      'Station offset ${state.driftM.toStringAsFixed(2)} m · '
+      'raw camera displacement ${state.rawStationDriftM.toStringAsFixed(2)} m',
+    );
+  }
+  if (state.rotatingInPlace) {
+    parts.add(
+      'Verified body-pivot rotation; raw excursion limit '
+      '${state.geometry.rotationMaxRawExcursionM.toStringAsFixed(2)} m',
+    );
+  }
+  if (state.movementWarning case final warning?) parts.add(warning);
+  if (state.stabilityRejection case final rejection?) {
+    parts.add('Stability window waiting: $rejection');
+  } else {
+    parts.add(
+      'Capture hold ${(state.stabilityProgress * 100).round()}%'
+      '${state.stable ? ' · stable' : ' · accumulating'}',
+    );
+  }
+  parts.add(
+    'Capture quality gates: fresh TRACKING pose, verified tracked shared '
+    'anchor, alignment within tolerance, a full '
+    '${state.geometry.stabilityWindow.inMilliseconds} ms hold, and station '
+    'offset ≤ ${state.geometry.stationDriftWarningM.toStringAsFixed(2)} m. '
+    'Validated body rotation is compensated only within its measured pivot '
+    'and raw-excursion limits.',
+  );
   if (state.meshTriangles > 0) {
     parts.add('GLB ${state.meshTriangles} tris in the scene');
   }
-  // What the hardware actually delivered: the resolution every saved
-  // photograph is written from, and whether the lens may autofocus. Without
-  // this line a blurry result has no explanation on screen — "soft lens" and
-  // "small stream" look identical and need opposite fixes.
   if (state.cameraQuality != null) {
     parts.add(state.cameraQuality!.describe());
   }
@@ -1087,25 +1202,11 @@ String _detailText(CaptureState state) {
   if (!state.assetsMatchSpec && state.meshTriangles > 0) {
     parts.add('GLB assets differ from the recorded dimensions');
   }
-  if (state.probes.isNotEmpty) {
-    parts.add(
-      '${state.probesWithSurface} of ${state.probes.length} directions have a '
-      'surface',
-    );
-  }
   if (state.lastError != null) parts.add(state.lastError!);
-  // The physical size of the marker, and how far away it is. **The world scale
-  // is fixed** — every target is `targetDiameterM` across, applied once when
-  // the scene is pushed and never re-derived from the camera. What changes as
-  // the phone moves is the *distance*, and with it the apparent size, which is
-  // ordinary perspective. These two numbers are what tell the two apart, so a
-  // marker that "got smaller" can be read off the screen instead of guessed.
   parts.add(
     'Plate ${state.geometry.targetDiameterM.toStringAsFixed(2)} m across'
     '${_distanceSuffix(state)}',
   );
-  // The advice is the actionable half of the status, so it goes last — but
-  // only when there is something to act on.
   if (_trackingAdvice(state) case final advice?) parts.add(advice);
   return parts.join(' · ');
 }
@@ -1168,17 +1269,16 @@ class _CollapseHandle extends StatelessWidget {
   );
 }
 
-/// One target, with an explicit verdict rather than a colour the user must
-/// interpret.
-///
-/// The four verdicts are the four states that actually differ in practice:
-/// a saved photograph, a failure with a reason, a target that can be attempted,
-/// and a target that cannot be attempted because no surface was found for it.
+/// One target, with an explicit capture/reference state.
 class _TargetRow extends StatelessWidget {
-  const _TargetRow({required this.target, this.probe, this.onRetake});
+  const _TargetRow({
+    required this.target,
+    required this.referenceAvailable,
+    this.onRetake,
+  });
 
   final CaptureTarget target;
-  final SurfaceProbe? probe;
+  final bool referenceAvailable;
 
   /// Present only for a saved target: the explicit reset that lets it be
   /// aligned and captured again.
@@ -1186,7 +1286,10 @@ class _TargetRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final (:verdict, :detail) = targetVerdict(target, probe: probe);
+    final (:verdict, :detail) = targetVerdict(
+      target,
+      referenceAvailable: referenceAvailable,
+    );
     final (label, color) = _appearance(verdict);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
@@ -1274,9 +1377,8 @@ class _TargetRow extends StatelessWidget {
       switch (verdict) {
         TargetVerdict.saved => ('Saved', CaptureColors.ok),
         TargetVerdict.failed => ('Failed', CaptureColors.danger),
-        TargetVerdict.noSurface => ('No surface', CaptureColors.pendingDot),
-        TargetVerdict.unscanned => ('Not scanned', CaptureColors.pendingDot),
-        TargetVerdict.ready => ('Ready', CaptureColors.accent),
+        TargetVerdict.referenceLost => ('Needs reference', CaptureColors.warn),
+        TargetVerdict.ready => ('Placed', CaptureColors.accent),
         TargetVerdict.active => ('Active', CaptureColors.accent),
       };
 }

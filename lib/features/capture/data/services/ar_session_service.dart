@@ -50,6 +50,9 @@ class ArSessionService {
 
   bool get isRunning => _session != null;
 
+  bool get isPaused => _isPaused;
+  bool _isPaused = false;
+
   ArCoreAvailability? get availability => _availability;
 
   ArCoreInstallResult? get installResult => _install;
@@ -118,13 +121,42 @@ class ArSessionService {
 
   /// Starts the session and the pose stream.
   Future<ArCoreSession> start({required int width, required int height}) async {
-    final session = await _host.start(width: width, height: height);
+    // The standalone 26-target sphere is computed from the calibrated camera
+    // pose and one world anchor. Plane finding is not part of this mode's
+    // placement or readiness contract. Other workflows call ArCoreHost.start
+    // with their own explicit configuration and keep their existing behavior.
+    final session = await _host.start(
+      width: width,
+      height: height,
+      planes: false,
+    );
     _session = session;
+    _isPaused = false;
     latest = null;
     lastError = null;
     _imageAxis = (x: 1, y: 0);
     _hasMeasuredImageAxis = false;
     return session;
+  }
+
+  /// Releases the camera while retaining this ARCore world and its anchors.
+  Future<void> pause() async {
+    if (_session == null || _isPaused) return;
+    // Record the lifecycle transition before crossing the platform boundary:
+    // even a failed pause must be followed by a resume attempt, never by
+    // trusting the cached pre-pause pose.
+    _isPaused = true;
+    latest = null;
+    await _host.pause();
+  }
+
+  /// Reopens the camera on the retained session. Capture remains gated until
+  /// the controller verifies fresh camera/anchor continuity.
+  Future<void> resume() async {
+    if (_session == null || !_isPaused) return;
+    await _host.resume();
+    _isPaused = false;
+    latest = null;
   }
 
   /// The pose stream. Every consumer shares one subscription: ARCore has one
@@ -198,6 +230,7 @@ class ArSessionService {
   Future<void> stop() async {
     await _host.stop();
     _session = null;
+    _isPaused = false;
     latest = null;
   }
 }

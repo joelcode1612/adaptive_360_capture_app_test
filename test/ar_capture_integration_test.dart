@@ -129,7 +129,7 @@ void main() {
       expect(probes, isEmpty);
     });
 
-    test('start enables plane detection and reports the texture', () async {
+    test('shared host default keeps plane detection enabled', () async {
       answer((MethodCall call) async {
         expect(call.method, 'start');
         final args = call.arguments as Map;
@@ -147,6 +147,30 @@ void main() {
       expect(session.planes, isTrue);
       expect(session.cameraImage, isTrue);
       expect(session.reused, isFalse);
+    });
+
+    test('host can explicitly start markerless with planes disabled', () async {
+      answer((MethodCall call) async {
+        expect(call.method, 'start');
+        final args = call.arguments as Map;
+        expect(args['planes'], isFalse);
+        return <String, Object?>{
+          'textureId': 8,
+          'planes': false,
+          'anchors': true,
+          'cameraImage': true,
+        };
+      });
+
+      final session = await host().start(
+        width: 1080,
+        height: 1920,
+        planes: false,
+      );
+      expect(session.planes, isFalse);
+      expect(session.anchors, isTrue);
+      expect(session.canAnchor, isFalse);
+      expect(session.canShoot, isTrue);
     });
   });
 }

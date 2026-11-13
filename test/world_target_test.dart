@@ -581,14 +581,18 @@ void main() {
         before,
         reason: 'a dropped station anchor is not silently re-created',
       );
-      expect(state.station, isNull);
+      expect(state.station?.stationId, 's1');
+      expect(harness.controller.requiresReferenceReestablishment, isTrue);
+      expect(state.targets, hasLength(kCaptureTargetCount));
       expect(state.readyToCapture, isFalse);
-      expect(state.captureBlockReason, contains('alibrat'));
+      expect(state.captureBlockReason, contains('AR tracking'));
       expect(state.capturedCount, photographs);
+      expect(harness.gateway.raycastCalls, 0);
 
-      // Recalibration is the one honest repair, and it places exactly one new
-      // shared anchor for all 26 nodes.
-      await harness.controller.calibrateStation();
+      // Verified re-establishment is the one honest repair, and it places
+      // exactly one new shared anchor for all 26 nodes under the retained
+      // logical station and target identities.
+      await harness.controller.recalibrateAndContinue('s1');
       await Harness.flush();
       expect(harness.controller.state.station, isNotNull);
       expect(harness.gateway.anchorCreations, before + 1);

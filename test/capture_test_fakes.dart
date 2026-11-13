@@ -79,6 +79,10 @@ class FakeArGateway implements ArCoreGateway {
   /// world position is computed, not discovered. The probe still uses them.
   int raycastCalls = 0;
 
+  /// The trackable key last passed to `createAnchor`; null identifies a
+  /// session world-space `Session.createAnchor(Pose)` request.
+  String? lastAnchorTrackableKey;
+
   /// When set, [createAnchor] refuses: the "AR would not hold the anchor"
   /// path.
   bool refuseAnchors = false;
@@ -195,6 +199,7 @@ class FakeArGateway implements ArCoreGateway {
           raw: _lastEmittedPose!,
           planesTracked: planesTracked,
           planeCount: planesTracked,
+          anchorCount: anchors.length,
           activeAnchorPose: live,
           activeAnchorId: live == null ? null : liveId,
         ),
@@ -229,6 +234,9 @@ class FakeArGateway implements ArCoreGateway {
   /// one, and a plain resume must not.
   int startCalls = 0;
 
+  /// The last plane-finding configuration requested by the caller.
+  bool? lastStartPlanes;
+
   /// When set, `start()` counts the call and then throws this — the way a real
   /// broken session start surfaces to the controller: as a thrown failure, not
   /// as an absent session or a mocked-out method.
@@ -241,11 +249,12 @@ class FakeArGateway implements ArCoreGateway {
     bool planes = true,
   }) async {
     startCalls++;
+    lastStartPlanes = planes;
     final failure = startError;
     if (failure != null) throw failure;
     return ArCoreSession(
       textureId: 1,
-      planes: true,
+      planes: planes,
       anchors: true,
       cameraImage: true,
       depth: false,
@@ -324,6 +333,7 @@ class FakeArGateway implements ArCoreGateway {
     required Quat orientation,
     String? trackableKey,
   }) async {
+    lastAnchorTrackableKey = trackableKey;
     final gate = anchorGate;
     if (gate != null) await gate;
     if (refuseAnchors) return null;

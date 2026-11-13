@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:adaptive_360_capture_app/features/capture/presentation/screens/ar_capture_screen.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/presentation/screens/sphere_capture_screen.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_flow_screen.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/screens/virtual_tour_camera_screen.dart';
@@ -32,7 +32,7 @@ class VirtualTourApp extends StatelessWidget {
       // The brief's §2 display name. `android:label` in the manifest is what the
       // launcher shows; this is what the OS task switcher and the window title
       // use, and the two agreeing is the only reason either is trustworthy.
-      title: '360° Virtual Tour',
+      title: 'SiteWise 360° Capture',
       debugShowCheckedModeBanner: false,
       // One theme for the whole app. The prototype keeps every screen —
       // settings and review included — inside `.phone{background:#0f1418}`, so
@@ -48,13 +48,14 @@ class VirtualTourApp extends StatelessWidget {
 ///
 /// Three, and the difference is stated rather than hidden:
 ///
-/// * **AR capture** is Section 1 — a real ARCore session, surface anchors, GLB
-///   marker, live pose and real photographs. Android only, because the ARCore
-///   host is a Kotlin host in this app and there is no ARKit equivalent yet; on
-///   any other platform the screen says so instead of degrading silently.
+/// * **AR 360° Capture (38 Targets)** is the 3DoF sphere-follows-phone flow.
+///   The sphere's centre is the phone, only rotation is tracked, and the 26
+///   targets are projected from the device quaternion — no ARCore session, no
+///   planes, no anchors and no calibration. This is the SiteWise 360° Capture
+///   architecture.
 /// * **Virtual tour** is the 30-node station: a 1.0 m world-locked sphere, the
 ///   GLB target at every node, an automatic shutter, then upload and stitching.
-///   Also Android/ARCore only, for the same reason.
+///   Android/ARCore only, and deliberately separate from the 3DoF flow.
 /// * **Guided flow** is the existing sensor-guided prototype port, which runs
 ///   anywhere and needs no AR.
 class CaptureLauncher extends StatelessWidget {
@@ -85,14 +86,15 @@ class CaptureLauncher extends StatelessWidget {
             ),
             const SizedBox(height: 28),
             _LaunchCard(
-              title: 'AR capture',
+              title: 'AR 360° Capture (38 Targets)',
               subtitle:
-                  'ARCore session, surface anchors and the GLB target. '
-                  '26 photographs per station. Android with ARCore only.',
-              icon: Icons.view_in_ar,
+                  '3DoF sphere-follows-phone capture: 38 targets, automatic '
+                  'shutter and an on-device 360° panorama. No ARCore, no '
+                  'calibration, no drift.',
+              icon: Icons.threesixty,
               onTap: () => Navigator.of(context).push(
                 MaterialPageRoute<void>(
-                  builder: (_) => const CaptureModuleScreen(),
+                  builder: (_) => const SphereCaptureScreen(),
                 ),
               ),
             ),
@@ -102,7 +104,7 @@ class CaptureLauncher extends StatelessWidget {
               subtitle:
                   'A 1.0 m sphere of world-locked markers with automatic '
                   'capture, then upload and stitching. Android with ARCore only.',
-              icon: Icons.threesixty,
+              icon: Icons.explore_outlined,
               onTap: () => Navigator.of(context).push(
                 MaterialPageRoute<void>(
                   builder: (_) => const VirtualTourCameraScreen(),
