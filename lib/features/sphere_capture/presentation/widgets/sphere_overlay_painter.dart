@@ -421,18 +421,35 @@ class SphereOverlayPainter extends CustomPainter {
         ..color = Colors.white.withValues(alpha: 0.85),
     );
 
+    // Two components, not one total: the user needs to know *which* way to
+    // turn and how far to tilt, because a 40° error made of 10° turn and 39°
+    // tilt is a completely different instruction from 40° turn and level.
+    // Both come from the controller's projected target direction — the same
+    // numbers the hold gate uses — never from screen geometry.
+    final turn = controller.guideTurnDeg;
+    final pitch = controller.guidePitchDeg;
+    final String horizontal = turn.abs() < 1
+        ? 'aligned'
+        : '${turn.abs().round()}° ${turn > 0 ? 'right' : 'left'}';
+    final String vertical = pitch.abs() < 1
+        ? 'level'
+        : '${pitch.abs().round()}° ${pitch > 0 ? 'up' : 'down'}';
     final label = TextPainter(
       text: TextSpan(
-        text: '${controller.guideErrorDeg.round()}°',
+        text: '$horizontal\n$vertical',
         style: const TextStyle(
           color: Colors.white,
           fontSize: 11,
+          height: 1.25,
           fontWeight: FontWeight.w700,
         ),
       ),
       textDirection: TextDirection.ltr,
+      textAlign: TextAlign.center,
     )..layout();
-    final labelCenter = tip - unit * 34;
+    // Keep the two-line box just inside the arrow, offset by its own height so
+    // a vertical edge does not clip it.
+    final labelCenter = tip - unit * (label.height / 2 + 12);
     canvas.drawRRect(
       RRect.fromRectAndRadius(
         Rect.fromCenter(

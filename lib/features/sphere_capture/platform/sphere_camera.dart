@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 
 /// The camera surface the sphere flow needs, and nothing more.
 ///
@@ -26,6 +27,30 @@ abstract class SphereCamera {
   Future<Uint8List> takePicture();
 
   Future<void> close();
+
+  /// Completes once the camera is open **and its preview has had a chance to
+  /// render its first frame**.
+  ///
+  /// The capture controller takes its reference heading only after this
+  /// completes. Taking it earlier described a phone pose from before the user
+  /// could see anything, so target 1 was anchored to wherever the phone was
+  /// mid-lift and then sat 20–40° outside the viewfinder once the preview
+  /// appeared.
+  ///
+  /// The default body covers fakes that have no texture: wait for [isOpen],
+  /// then one compositor frame. [PluginSphereCamera] overrides it with a
+  /// stricter wait on the real controller.
+  Future<void> ensurePreviewReady({
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (!isOpen && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    if (DateTime.now().isBefore(deadline)) {
+      await SchedulerBinding.instance.endOfFrame;
+    }
+  }
 }
 
 /// The production camera: `camera` (CameraX on Android), rear lens, no audio.
@@ -156,5 +181,35 @@ class PluginSphereCamera implements SphereCamera {
     final controller = _controller;
     _controller = null;
     await controller?.dispose();
+  }
+
+  /// Waits until the platform preview is configured **and** has rendered.
+  ///
+  /// Two conditions matter here:
+  ///
+  /// 1. `isInitialized` with a reported `previewSize` — the stream exists.
+  /// 2. At least two compositor frames — the texture is attached and drawn.
+  ///
+  /// The capture controller seeds the sphere's reference heading only after
+  /// this completes, so the reference describes a frame the user can actually
+  /// see. Seeding it earlier (the previous behaviour) anchored target 1 to the
+  /// phone's pose mid-lift; by the time the preview appeared, the phone had
+  /// turned 20–40° and target 1 was outside the viewfinder.
+  @override
+  Future<void> ensurePreviewReady({
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final controller = _controller;
+    if (controller == null) return;
+    final deadline = DateTime.now().add(timeout);
+    while ((!controller.value.isInitialized ||
+            controller.value.previewSize == null) &&
+        DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    for (var frame = 0; frame < 2; frame++) {
+      if (DateTime.now().isAfter(deadline)) break;
+      await SchedulerBinding.instance.endOfFrame;
+    }
   }
 }

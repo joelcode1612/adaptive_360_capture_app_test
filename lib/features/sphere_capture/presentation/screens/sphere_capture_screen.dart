@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -388,47 +389,40 @@ class _LiveCapture extends StatelessWidget {
     body: Stack(
       fit: StackFit.expand,
       children: [
-        Positioned.fill(child: camera.preview()),
-        Positioned.fill(
-          child: LayoutBuilder(
-            builder: (BuildContext context, BoxConstraints constraints) =>
-                RepaintBoundary(
-                  child: CustomPaint(
-                    painter: SphereOverlayPainter(
-                      controller: controller,
-                      projection: SphereProjection(
-                        width: constraints.maxWidth,
-                        height: constraints.maxHeight,
+        // Toolbar and capture controls sit OUTSIDE the viewfinder; the camera
+        // image lives in an explicit 3:4 box whose size drives the marker
+        // projection. Previously the preview filled the whole screen and the
+        // overlay was projected for that fullscreen viewport, so on a tall
+        // phone the preview was cover-cropped horizontally while the markers
+        // were laid out for the cropped width — the geometry only stayed
+        // consistent by accident, and the visible framing was never the 3:4
+        // frame the photographs actually capture.
+        SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: _TopBar(controller: controller),
+              ),
+              Expanded(
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    child: AspectRatio(
+                      aspectRatio: 3 / 4,
+                      child: _Viewfinder(
+                        controller: controller,
+                        camera: camera,
                       ),
                     ),
                   ),
                 ),
-          ),
-        ),
-        SafeArea(
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              Positioned(
-                top: 8,
-                left: 12,
-                right: 12,
-                child: _TopBar(controller: controller),
               ),
-              Positioned(
-                top: 92,
-                left: 24,
-                right: 24,
-                child: AnimatedBuilder(
-                  animation: controller,
-                  builder: (BuildContext context, Widget? child) =>
-                      _CapturedBanner(visible: controller.banner != null),
-                ),
-              ),
-              Positioned(
-                left: 16,
-                right: 16,
-                bottom: 16,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
                 child: AnimatedBuilder(
                   animation: controller,
                   builder: (BuildContext context, Widget? child) =>
@@ -453,6 +447,234 @@ class _LiveCapture extends StatelessWidget {
       ],
     ),
   );
+}
+
+/// Whether the verbose projection diagnostics are compiled in. Off unless the
+/// run asks for it: `--dart-define=sphere_diagnostics=true`.
+const bool kSphereDiagnostics = bool.fromEnvironment('sphere_diagnostics');
+
+/// The portrait 3:4 viewfinder: the camera image, the marker overlay and the
+/// reticle, all in one coordinate system.
+///
+/// The preview is a 3:4 sensor frame (the same aspect the JPEG is saved at),
+/// so at exactly 3:4 it fills the box without cropping or stretching — which
+/// is what lets [SphereProjection]'s pinhole model describe the visible image
+/// exactly, and the reticle at the box centre is the optical axis.
+class _Viewfinder extends StatelessWidget {
+  const _Viewfinder({required this.controller, required this.camera});
+
+  final SphereCaptureController controller;
+  final SphereCamera camera;
+
+  @override
+  Widget build(BuildContext context) => ClipRRect(
+    borderRadius: BorderRadius.circular(12),
+    child: ColoredBox(
+      color: Colors.black,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          camera.preview(),
+          LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              // The preview is cover-fitted into this 3:4 box, so the vertical
+              // FOV actually visible is the camera's, narrowed by the crop
+              // whenever the preview frame is taller than 3:4. Projecting the
+              // full camera FOV onto a cropped viewfinder would push every
+              // off-axis marker too far from the reticle — which reads as
+              // "the middle ring is too high" as soon as the phone tilts.
+              final viewfinderAspect =
+                  constraints.maxWidth / constraints.maxHeight;
+              final visibleFov = visibleVerticalFovDeg(
+                cameraVerticalFovDeg: kSphereAssumedVerticalFovDeg,
+                frameAspect: camera.previewAspectRatio ?? 0.75,
+                viewfinderAspect: viewfinderAspect,
+              );
+              final projection = SphereProjection(
+                width: constraints.maxWidth,
+                height: constraints.maxHeight,
+                verticalFovDeg: visibleFov,
+              );
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  RepaintBoundary(
+                    child: CustomPaint(
+                      painter: SphereOverlayPainter(
+                        controller: controller,
+                        projection: projection,
+                      ),
+                    ),
+                  ),
+                  if (kSphereDiagnostics)
+                    Align(
+                      alignment: Alignment.bottomLeft,
+                      child: Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: _ProjectionDiagnostics(
+                          controller: controller,
+                          camera: camera,
+                          projection: projection,
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+          Positioned(
+            top: 10,
+            left: 16,
+            right: 16,
+            child: Center(
+              child: AnimatedBuilder(
+                animation: controller,
+                builder: (BuildContext context, Widget? child) =>
+                    _CapturedBanner(visible: controller.banner != null),
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// The verbose projection diagnostics panel (only compiled in behind
+/// `--dart-define=sphere_diagnostics=true`).
+///
+/// Logs the numbers needed to answer "is the middle ring where gravity says
+/// it is" from a device log — viewfinder geometry, the lens assumption, the
+/// camera's elevation relative to the levelled reference, the selected
+/// target's fixed direction, and where both the target and the reticle are
+/// drawn. Throttled to once a second: the sensor itself runs at 50 Hz and a
+/// per-sample log would drown the device console.
+class _ProjectionDiagnostics extends StatefulWidget {
+  const _ProjectionDiagnostics({
+    required this.controller,
+    required this.camera,
+    required this.projection,
+  });
+
+  final SphereCaptureController controller;
+  final SphereCamera camera;
+  final SphereProjection projection;
+
+  @override
+  State<_ProjectionDiagnostics> createState() => _ProjectionDiagnosticsState();
+}
+
+class _ProjectionDiagnosticsState extends State<_ProjectionDiagnostics> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) => _log());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _log() {
+    final c = widget.controller;
+    final p = widget.projection;
+    final device = c.deviceToWorld;
+    final start = c.startDeviceToWorld;
+    final target = c.activeTarget;
+    double? elevationDeg;
+    double? referenceHeadingDeg;
+    Offset? projected;
+    if (device != null && start != null) {
+      // The camera's elevation in the *levelled sphere frame* (+Y up): the
+      // same frame the middle ring's 0° pitch is defined in, so a non-zero
+      // value here is exactly the angle by which the horizon sits above or
+      // below the reticle.
+      final relative = (start.conjugate * device).normalized;
+      final forward = relative.rotate(const Vec3(0, 0, -1));
+      elevationDeg =
+          math.asin(forward.y.clamp(-1.0, 1.0)) * 180 / math.pi;
+      final reference = start.rotate(const Vec3(0, 0, -1));
+      referenceHeadingDeg =
+          math.atan2(reference.x, -reference.z) * 180 / math.pi;
+      if (target != null) {
+        projected = p.project(
+          sphereTargetCameraDirection(
+            deviceToWorld: device,
+            startDeviceToWorld: start,
+            startDirection: target.spec.direction,
+          ),
+        );
+      }
+    }
+    debugPrint(
+      'SPHERE_VIEW: viewfinder=${p.width.round()}x${p.height.round()} '
+      'aspect=${(p.width / p.height).toStringAsFixed(3)} '
+      'previewAspect=${widget.camera.previewAspectRatio?.toStringAsFixed(3) ?? 'n/a'} '
+      'vfov=${p.verticalFovDeg.toStringAsFixed(1)}° '
+      'focalY=${p.focalLengthY.toStringAsFixed(1)} '
+      'cameraElevation=${elevationDeg?.toStringAsFixed(1) ?? 'n/a'}° '
+      'referenceHeading=${referenceHeadingDeg?.toStringAsFixed(1) ?? 'n/a'}° '
+      'target=${target?.spec.targetId ?? '-'} '
+      'yaw=${target?.spec.yawDeg.toStringAsFixed(0) ?? '-'}° '
+      'pitch=${target?.spec.pitchDeg.toStringAsFixed(0) ?? '-'}° '
+      'projected=${projected == null ? 'off-screen' : '(${projected.dx.toStringAsFixed(0)},${projected.dy.toStringAsFixed(0)})'} '
+      'reticle=(${(p.width / 2).round()},${(p.height / 2).round()}) '
+      'error=${c.activeErrorDeg.toStringAsFixed(1)}°',
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.controller;
+    final target = c.activeTarget;
+    final device = c.deviceToWorld;
+    final start = c.startDeviceToWorld;
+    var elevation = 'n/a';
+    if (device != null && start != null) {
+      final relative = (start.conjugate * device).normalized;
+      final forward = relative.rotate(const Vec3(0, 0, -1));
+      elevation =
+          '${(math.asin(forward.y.clamp(-1.0, 1.0)) * 180 / math.pi).toStringAsFixed(1)}°';
+    }
+    return IgnorePointer(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: DefaultTextStyle(
+          style: const TextStyle(
+            color: Colors.white70,
+            fontSize: 9.5,
+            height: 1.3,
+            fontFamily: 'monospace',
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'vf ${widget.projection.width.round()}×'
+                '${widget.projection.height.round()} '
+                'f${widget.projection.focalLengthY.round()}',
+              ),
+              Text('elev $elevation  err ${c.activeErrorDeg.toStringAsFixed(1)}°'),
+              Text(
+                'T${target?.spec.targetId ?? '-'} '
+                'y${target?.spec.yawDeg.toStringAsFixed(0) ?? '-'} '
+                'p${target?.spec.pitchDeg.toStringAsFixed(0) ?? '-'}',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _TopBar extends StatelessWidget {

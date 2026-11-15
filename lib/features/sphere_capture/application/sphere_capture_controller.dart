@@ -154,6 +154,23 @@ class SphereCaptureController extends ChangeNotifier {
   String? _message;
   Quat? _deviceToWorld;
   Quat? _startDeviceToWorld;
+
+  /// When the camera preview first became renderable.
+  ///
+  /// Rotation samples that arrive before this describe a phone pose from
+  /// before the user could see the viewfinder, so they can never seed the
+  /// reference heading. Seeding from one of those was the startup defect:
+  /// the reference described a mid-lift pose and target 1 ended up 20–40°
+  /// outside the viewfinder once the preview appeared.
+  DateTime? _previewReadyAt;
+
+  /// Arrival time of the previous rotation sample, for the continuity check
+  /// that keeps a single stale/glitched event from freezing the reference.
+  DateTime? _lastRotationArrivalAt;
+
+  /// Completes the moment the reference heading is established, so `start()`
+  /// can flip to `ready` only when the sphere is actually anchored.
+  Completer<void>? _referenceCompleter;
   int? _activeTargetId;
   double _activeErrorDeg = 180;
   double _holdProgress = 0;
@@ -375,6 +392,9 @@ class SphereCaptureController extends ChangeNotifier {
     // whatever pose a previous, failed attempt happened to record.
     _deviceToWorld = null;
     _startDeviceToWorld = null;
+    _previewReadyAt = null;
+    _lastRotationArrivalAt = null;
+    _referenceCompleter = Completer<void>();
     _holdProgress = 0;
     _holdTargetId = null;
     _lastSampleAt = null;
@@ -390,6 +410,13 @@ class SphereCaptureController extends ChangeNotifier {
     try {
       await _permissions.ensureCapturePermissions();
       await _camera.open();
+      // The preview must be visible before the reference heading is taken.
+      // `open()` only guarantees the platform stream is configured; the
+      // texture still has to attach and draw. A reference taken before that
+      // anchors the sphere to a pose the user could not see yet — the cause
+      // of target 1 appearing outside the viewfinder at Start.
+      await _camera.ensurePreviewReady();
+      _previewReadyAt = _clock();
       // A retry after a failure must not leave the previous subscription
       // attached: two listeners would double every hold increment.
       await _rotationSubscription?.cancel();
@@ -402,9 +429,25 @@ class SphereCaptureController extends ChangeNotifier {
       if (motion != null) {
         _motionSubscription = motion.listen(_onMotionSample);
       }
+      _message = 'Aligning the sphere…';
+      _notify();
+      // Wait for a fresh, settled sample to establish the reference heading.
+      // Bounded: if the phone is pointing at a pole there is no heading to
+      // take, and the guidance below tells the user how to fix that rather
+      // than blocking the screen forever.
+      await _referenceCompleter?.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
       _phase = SphereCapturePhase.ready;
       _recomputeGuide();
-      _message = 'Point the phone at a target and hold it inside the ring.';
+      if (_startDeviceToWorld == null) {
+        _message =
+            'Point the phone towards the room — not straight down or straight '
+            'up — so the sphere has a horizon to sit on.';
+      } else {
+        _message = 'Point the phone at a target and hold it inside the ring.';
+      }
     } on CaptureFailure catch (error) {
       _phase = SphereCapturePhase.failed;
       _message = error.message;
@@ -424,10 +467,16 @@ class SphereCaptureController extends ChangeNotifier {
   }
 
   void _onRotation(Quat quaternion) {
-    if (_phase != SphereCapturePhase.ready &&
+    // `starting` is included on purpose: the reference heading is established
+    // from a rotation sample during startup, not before it.
+    if (_phase != SphereCapturePhase.starting &&
+        _phase != SphereCapturePhase.ready &&
         _phase != SphereCapturePhase.capturing) {
       return;
     }
+    final now = _clock();
+    final previousArrival = _lastRotationArrivalAt;
+    _lastRotationArrivalAt = now;
     _deviceToWorld = quaternion;
     // The sphere's reference frame is the start pose **levelled**: heading kept,
     // pitch and roll dropped. Seeding it from the raw first sample baked the
@@ -440,7 +489,37 @@ class SphereCaptureController extends ChangeNotifier {
     // `+Y`. Levelling with the wrong axis turns the "yaw" into a roll and tilts
     // every ring by 90°. See [levelStartFrame].
     final worldUp = _rotation.worldUp;
-    _startDeviceToWorld ??= levelStartFrame(quaternion, worldUp: worldUp);
+    if (_startDeviceToWorld == null) {
+      // A sample may seed the reference only when it is *fresh* in the two
+      // senses that matter at startup:
+      //
+      //  * it arrived after the preview was renderable (plus a short settle
+      //    window), so it describes the phone where the user can actually see
+      //    the viewfinder rather than mid-lift; and
+      //  * it is part of a continuous stream (the previous sample was recent),
+      //    so a single stale or glitched event cannot freeze the heading.
+      //
+      // Until both hold, the pose keeps updating — the first rendered frame
+      // after `ready` is already correct — but nothing is anchored.
+      final readyAt = _previewReadyAt;
+      final settled =
+          readyAt != null &&
+          now.difference(readyAt) >= const Duration(milliseconds: 250);
+      final continuous =
+          previousArrival != null &&
+          now.difference(previousArrival) <=
+              const Duration(milliseconds: 150);
+      if (!settled || !continuous) {
+        return;
+      }
+      _startDeviceToWorld = levelStartFrame(quaternion, worldUp: worldUp);
+      final completer = _referenceCompleter;
+      if (_startDeviceToWorld != null &&
+          completer != null &&
+          !completer.isCompleted) {
+        completer.complete();
+      }
+    }
     final start = _startDeviceToWorld;
     if (start == null) {
       // The phone is pointing too close to straight up or down for a heading to
@@ -469,8 +548,6 @@ class SphereCaptureController extends ChangeNotifier {
         '${worldUp.z.toStringAsFixed(0)})',
       );
     }
-
-    final now = _clock();
 
     // **One target, one decision.** The target the arrow points at, the target
     // the pill names, the target whose ring fills and the target the shutter
@@ -585,6 +662,8 @@ class SphereCaptureController extends ChangeNotifier {
         imageHeight: normalized.height,
         sourceImageWidth: normalized.sourceWidth,
         sourceImageHeight: normalized.sourceHeight,
+        cropOffsetX: normalized.cropOffsetX,
+        cropOffsetY: normalized.cropOffsetY,
         imageFormat: 'jpeg',
         toleranceDeg: toleranceDeg,
       );
@@ -787,9 +866,9 @@ class SphereCaptureController extends ChangeNotifier {
   /// |---|---|---|
   /// | within a ring | 30° | 12 targets over 360° |
   /// | middle → zenith | 90° | a pole is 90° from *every* horizon target |
-  /// | zenith → upper | 45° | 90° − 45° |
-  /// | upper → lower | 90° | 45° above to 45° below |
-  /// | lower → nadir | 45° | 90° − 45° |
+  /// | zenith → upper | 55° | 90° − 35° |
+  /// | upper → lower | 70° | 35° above to 35° below |
+  /// | lower → nadir | 55° | 90° − 35° |
   ///
   /// Any route must pay at least one 90° step to reach a pole, because the
   /// zenith is 90° from every non-pole direction. This order pays two — one per

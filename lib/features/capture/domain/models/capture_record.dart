@@ -40,6 +40,12 @@ class CaptureRecord {
 
   final int sourceImageWidth;
   final int sourceImageHeight;
+
+  /// Top-left of the 3:4 crop inside the source frame, in source pixels —
+  /// `0, 0` when the frame needed no crop. The panorama stitcher rebuilds the
+  /// principal point from these, so projection stays correct for any crop.
+  final int cropOffsetX;
+  final int cropOffsetY;
   final int? captureTimestampNs;
   final double? focalLengthXPx;
   final double? focalLengthYPx;
@@ -72,6 +78,8 @@ class CaptureRecord {
     required this.imageHeight,
     this.sourceImageWidth = 0,
     this.sourceImageHeight = 0,
+    this.cropOffsetX = 0,
+    this.cropOffsetY = 0,
     this.captureTimestampNs,
     this.focalLengthXPx,
     this.focalLengthYPx,
@@ -99,6 +107,8 @@ class CaptureRecord {
     'imageHeight': imageHeight,
     'sourceImageWidth': sourceImageWidth,
     'sourceImageHeight': sourceImageHeight,
+    'cropOffsetX': cropOffsetX,
+    'cropOffsetY': cropOffsetY,
     if (captureTimestampNs != null) 'captureTimestampNs': captureTimestampNs,
     if (focalLengthXPx != null) 'focalLengthXPx': focalLengthXPx,
     if (focalLengthYPx != null) 'focalLengthYPx': focalLengthYPx,
@@ -130,6 +140,8 @@ class CaptureRecord {
     imageHeight: (json['imageHeight'] as num?)?.toInt() ?? 0,
     sourceImageWidth: (json['sourceImageWidth'] as num?)?.toInt() ?? 0,
     sourceImageHeight: (json['sourceImageHeight'] as num?)?.toInt() ?? 0,
+    cropOffsetX: (json['cropOffsetX'] as num?)?.toInt() ?? 0,
+    cropOffsetY: (json['cropOffsetY'] as num?)?.toInt() ?? 0,
     captureTimestampNs: (json['captureTimestampNs'] as num?)?.toInt(),
     focalLengthXPx: (json['focalLengthXPx'] as num?)?.toDouble(),
     focalLengthYPx: (json['focalLengthYPx'] as num?)?.toDouble(),

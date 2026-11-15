@@ -4,11 +4,14 @@ import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'package:path/path.dart' as p;
 
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/data/stitch_job_runner.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/equirect_bounds.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_intrinsics.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 
@@ -35,14 +38,24 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quate
 /// blends only where the best and second-best weights are within 3% — a narrow
 /// seam band, not a double exposure.
 ///
-/// The whole projection runs in a background isolate: 26 frames take several
+/// The whole projection runs in a background isolate: 38 frames take several
 /// seconds and must not block the Flutter UI thread (the previous on-thread
-/// stitch caused an ANR).
+/// stitch caused an ANR). The isolate hand-off itself — the part that used to
+/// fail with an unsendable `ReceivePort` — lives in [StitchJobRunner], where
+/// only plain data and a `SendPort` cross the boundary.
 class EquirectangularStitcher implements PanoramaStitcher {
-  const EquirectangularStitcher({this.width = 2048});
+  const EquirectangularStitcher({
+    this.width = 2048,
+    this.worker = _projectEquirect,
+  });
 
   /// Output width in pixels; height is half of it, i.e. a 2:1 equirectangular.
   final int width;
+
+  /// The projection entry point. Top-level by default; injectable so the
+  /// isolate contract (progress plumbing, error propagation, duplicate-job
+  /// rejection) is testable without the native OpenCV library.
+  final StitchWorker worker;
 
   @override
   Future<StitchResult> stitchFrames(
@@ -61,39 +74,36 @@ class EquirectangularStitcher implements PanoramaStitcher {
       );
     }
     final outPath = p.join(stationDir, 'panorama.jpg');
-    // ReceivePort reports progress from the compute isolate without blocking UI.
-    final progressPort = ReceivePort();
-    final progressSubscription = progressPort.listen((dynamic message) {
-      if (message is String) onStage?.call(message);
-    });
     onStage?.call('Preparing ${imagePaths.length} photographs…');
-    try {
-      final result = await Isolate.run(
-        () =>
-            _projectEquirect(stationDir, outPath, width, progressPort.sendPort),
-      );
-      if (!result.ok) return StitchResult.failure(result.message);
-      return StitchResult(
-        success: true,
-        panoramaPath: outPath,
-        message: 'Panorama generated successfully.',
-      );
-    } catch (error) {
-      return StitchResult.failure('Panorama projection failed: $error');
-    } finally {
-      await progressSubscription.cancel();
-      progressPort.close();
-    }
+    // The runner keeps the ReceivePort in this isolate and hands the worker
+    // only a sendable record containing its SendPort. It also refuses a
+    // second concurrent run for the same station.
+    final result = await StitchJobRunner.run(
+      worker: worker,
+      stationDir: stationDir,
+      outPath: outPath,
+      width: width,
+      onStage: onStage,
+    );
+    if (!result.ok) return StitchResult.failure(result.message);
+    return StitchResult(
+      success: true,
+      panoramaPath: outPath,
+      message: 'Panorama generated successfully.',
+    );
   }
 }
 
+/// Whether the stitcher's verbose diagnostics are compiled in. Off unless the
+/// run asks for it: `--dart-define=sphere_stitch_log=true`.
+const bool kSphereStitchLog = bool.fromEnvironment('sphere_stitch_log');
+
 /// The projection, on a background isolate.
-({bool ok, String message}) _projectEquirect(
-  String stationDir,
-  String outPath,
-  int width,
-  SendPort progress,
-) {
+({bool ok, String message}) _projectEquirect(StitchWorkerArgs args) {
+  final stationDir = args.stationDir;
+  final outPath = args.outPath;
+  final width = args.width;
+  final SendPort progress = args.progress;
   final stopwatch = Stopwatch()..start();
   final recordsFile = File(p.join(stationDir, 'records.json'));
   final raw = jsonDecode(recordsFile.readAsStringSync());
@@ -165,22 +175,49 @@ class EquirectangularStitcher implements PanoramaStitcher {
 
       final imageWidth = mat.cols;
       final imageHeight = mat.rows;
-      // The still's focal length in pixels, from the one documented FOV
-      // assumption the overlay also uses. The previous `0.75 × longest side`
-      // was an unexplained constant that happened to imply 53° horizontal on a
-      // 4:3 frame; deriving it from `kSphereAssumedVerticalFovDeg` means the
-      // aiming graphics and the panorama cannot disagree about the lens.
-      // A centred crop keeps the focal length and moves the principal point to
-      // the crop centre, so the focal comes from the *uncropped* frame the
-      // record kept. Records written before that field existed fall back to the
-      // decoded height, which is exact when no crop was applied.
-      final sourceHeight =
-          (record['sourceImageHeight'] as num?)?.toInt() ?? imageHeight;
-      final focal =
-          (sourceHeight / 2) /
-          math.tan(kSphereAssumedVerticalFovDeg * math.pi / 360);
-      final cx = imageWidth / 2;
-      final cy = imageHeight / 2;
+      // Focal length and principal point **in the decoded image's coordinate
+      // system**. The stitcher decodes reduced (IMREAD_REDUCED_COLOR_4 by
+      // default), so the lens focal — a lens property, computed once on the
+      // uncropped source frame — must be multiplied by the decode scale, and
+      // the principal point must follow the recorded crop offsets. Using the
+      // source height directly against a quarter-scale decoded image overstated
+      // the focal 4×: every frame's angular footprint collapsed to about a
+      // quarter of its true size and the coverage audit saw holes almost
+      // everywhere. See `decodedProjection` for the full transform.
+      final decoded = decodedProjection(
+        decodedWidth: imageWidth,
+        decodedHeight: imageHeight,
+        savedWidth: (record['imageWidth'] as num?)?.toInt() ?? 0,
+        savedHeight: (record['imageHeight'] as num?)?.toInt() ?? 0,
+        sourceWidth: (record['sourceImageWidth'] as num?)?.toInt() ?? 0,
+        sourceHeight: (record['sourceImageHeight'] as num?)?.toInt() ?? 0,
+        verticalFovDeg: kSphereAssumedVerticalFovDeg,
+        cropOffsetX: (record['cropOffsetX'] as num?)?.toInt() ?? 0,
+        cropOffsetY: (record['cropOffsetY'] as num?)?.toInt() ?? 0,
+      );
+      if (decoded == null) {
+        return (
+          ok: false,
+          message:
+              'A photograph has invalid dimensions ($imageWidth×'
+              '$imageHeight), so it cannot be projected.',
+        );
+      }
+      final focal = decoded.focalPx;
+      final cx = decoded.cx;
+      final cy = decoded.cy;
+      if (kSphereStitchLog && frameIndex == 0) {
+        debugPrint(
+          'SPHERE_STITCH: decoded=${imageWidth}x$imageHeight '
+          'saved=${record['imageWidth']}x${record['imageHeight']} '
+          'source=${record['sourceImageWidth']}x${record['sourceImageHeight']} '
+          'decodeScale=${decoded.decodeScale.toStringAsFixed(3)} '
+          'focalSource=${(decoded.focalPx / decoded.decodeScale).toStringAsFixed(1)} '
+          'focalDecoded=${decoded.focalPx.toStringAsFixed(1)} '
+          'hfov=${decoded.horizontalFovDeg.toStringAsFixed(2)}° '
+          'vfov=${decoded.verticalFovDegDeg.toStringAsFixed(2)}°',
+        );
+      }
       final pixels = mat.data;
       final rowStride = imageWidth * 3;
       final marginX = 0.05 * imageWidth;
@@ -352,8 +389,8 @@ class EquirectangularStitcher implements PanoramaStitcher {
   //
   // Equirectangular rows are not equal-area: a row at latitude φ covers only
   // cos(φ) of what an equatorial row does. Counting pixels would overstate
-  // coverage near the poles — which is exactly where the 26-target layout used
-  // to leave holes — so every number below is area-weighted.
+  // coverage near the poles — which is exactly where a sparse layout leaves
+  // holes — so every number below is area-weighted.
   //
   // `single` is the one that decides success: every direction of the finished
   // sphere must come from a real photograph. The previous gate accepted 90%,
@@ -365,12 +402,18 @@ class EquirectangularStitcher implements PanoramaStitcher {
   var worstRowWeight = -1.0;
   var worstLat = 0.0;
   var worstLon = 0.0;
+  // 15°-cell grid of uncovered area, for the "where are the holes" report.
+  const gapCols = 24;
+  const gapRows = 12;
+  final gapCells = Float64List(gapCols * gapRows);
   for (var y = 0; y < height; y++) {
     final rowWeight = cosLat[y];
     totalArea += rowWeight * width;
     for (var x = 0; x < width; x++) {
       final n = hits[y * width + x];
       if (n == 0) {
+        gapCells[(y * gapRows ~/ height) * gapCols + (x * gapCols ~/ width)] +=
+            rowWeight;
         // Remember the widest remaining gap, preferring the horizon: a hole
         // there is far more visible than one at the pole.
         if (rowWeight > worstRowWeight) {
@@ -388,6 +431,102 @@ class EquirectangularStitcher implements PanoramaStitcher {
   final single = singleArea / totalArea;
   final doubleCoverage = doubleArea / totalArea;
   final tripleCoverage = tripleArea / totalArea;
+  if (kSphereStitchLog) {
+    debugPrint(
+      'SPHERE_STITCH: coverage single=${(single * 100).toStringAsFixed(2)}% '
+      'double=${(doubleCoverage * 100).toStringAsFixed(2)}% '
+      'triple=${(tripleCoverage * 100).toStringAsFixed(2)}% '
+      'uncovered=${((1 - single) * 100).toStringAsFixed(2)}% '
+      'output=${width}x$height',
+    );
+  }
+
+  // ── Coverage diagnostics, written whether the gate passes or not ─────
+  //
+  // The map is generated from the *actual* photographs and their recorded
+  // orientations — the same hits buffer the audit used — never from the ideal
+  // layout alone. A passing coverage number says every direction received
+  // real pixels; it does **not** claim the seams are invisible or the
+  // alignment visually perfect.
+  final mapBytes = Uint8List(width * height * 3);
+  for (var i = 0; i < width * height; i++) {
+    // Red: uncovered. Yellow: one photograph. Blue: two. Teal: three or more.
+    final (r, g, b) = switch (hits[i]) {
+      0 => (190, 40, 40),
+      1 => (235, 200, 60),
+      2 => (60, 110, 220),
+      _ => (40, 190, 180),
+    };
+    mapBytes[i * 3] = r;
+    mapBytes[i * 3 + 1] = g;
+    mapBytes[i * 3 + 2] = b;
+  }
+  final mapPath = p.join(File(outPath).parent.path, 'coverage_map.jpg');
+  _encodeJpeg(mapPath, width, height, mapBytes);
+  final rankedGaps = <Map<String, Object?>>[];
+  for (var cell = 0; cell < gapCells.length; cell++) {
+    if (gapCells[cell] <= 0) continue;
+    rankedGaps.add({
+      'longitudeDeg': -180 + ((cell % gapCols) + 0.5) / gapCols * 360,
+      'latitudeDeg':
+          90 - ((cell ~/ gapCols) + 0.5) / gapRows * 180,
+      'uncoveredAreaPercent': gapCells[cell] / totalArea * 100,
+    });
+  }
+  rankedGaps.sort(
+    (a, b) => (b['uncoveredAreaPercent']! as double).compareTo(
+      a['uncoveredAreaPercent']! as double,
+    ),
+  );
+  try {
+    File(
+      p.join(File(outPath).parent.path, 'coverage_report.json'),
+    ).writeAsStringSync(
+      jsonEncode(<String, Object?>{
+        'generatedAt': DateTime.now().toUtc().toIso8601String(),
+        'station': File(outPath).parent.path,
+        'panorama': {
+          'path': outPath,
+          'width': width,
+          'height': height,
+          'aspect': '2:1 equirectangular',
+        },
+        'photographCount': records.length,
+        'verticalFovAssumedDeg': kSphereAssumedVerticalFovDeg,
+        'thresholdPercent': 99.5,
+        'passed': single >= 0.995,
+        'coveragePercent': {
+          'single': single * 100,
+          'double': doubleCoverage * 100,
+          'triple': tripleCoverage * 100,
+        },
+        'uncoveredPercent': (1 - single) * 100,
+        'coverageMapPath': mapPath,
+        if (single < 1)
+          'largestGap': {
+            'longitudeDeg': worstLon,
+            'latitudeDeg': worstLat,
+          },
+        'uncoveredRegions': rankedGaps
+            .take(6)
+            .map(
+              (Map<String, Object?> region) => <String, Object?>{
+                'longitudeDeg':
+                    (region['longitudeDeg']! as double).toStringAsFixed(1),
+                'latitudeDeg':
+                    (region['latitudeDeg']! as double).toStringAsFixed(1),
+                'uncoveredAreaPercent': (region['uncoveredAreaPercent']! as double)
+                    .toStringAsFixed(3),
+              },
+            )
+            .toList(growable: false),
+      }),
+      flush: true,
+    );
+  } catch (_) {
+    // A missing report must not fail an otherwise valid panorama; the map is
+    // diagnostics, not the product.
+  }
 
   if (single < 0.995) {
     final lon = worstLon >= 0 ? '+${worstLon.round()}' : '${worstLon.round()}';
@@ -403,37 +542,48 @@ class EquirectangularStitcher implements PanoramaStitcher {
   }
 
   // Write PPM (cheap, no encoder in Dart), then let OpenCV encode the JPEG.
-  final ppmPath = p.join(File(outPath).parent.path, '.panorama.ppm');
-  final header = Uint8List.fromList(ascii.encode('P6\n$width $height\n255\n'));
-  final bytes = BytesBuilder(copy: false)
-    ..add(header)
-    ..add(output);
-  File(ppmPath).writeAsBytesSync(bytes.takeBytes(), flush: true);
-  final ppm = cv.imread(ppmPath, flags: cv.IMREAD_COLOR);
-  if (ppm.isEmpty) {
-    ppm.dispose();
-    return (ok: false, message: 'The panorama canvas could not be encoded.');
-  }
-  try {
-    if (!cv.imwrite(outPath, ppm)) {
-      return (ok: false, message: 'The panorama could not be saved.');
-    }
-  } finally {
-    ppm.dispose();
-    try {
-      File(ppmPath).deleteSync();
-    } catch (_) {
-      // Best effort; the JPEG is what matters.
-    }
+  if (!_encodeJpeg(outPath, width, height, output)) {
+    return (ok: false, message: 'The panorama could not be saved.');
   }
   return (
     ok: true,
     message:
-        'Panorama generated. Coverage '
+        'Panorama generated ($width×$height). Coverage '
         '${(single * 100).toStringAsFixed(1)}% single, '
         '${(doubleCoverage * 100).toStringAsFixed(1)}% double, '
         '${(tripleCoverage * 100).toStringAsFixed(1)}% triple.',
   );
+}
+
+/// Encodes an RGB byte buffer as a JPEG at [path] through a PPM intermediate
+/// (Dart has no JPEG encoder; OpenCV reads PPM and writes JPEG).
+///
+/// The temporary PPM is deleted afterwards; a failure to delete it is
+/// harmless and ignored. Returns whether the JPEG exists and is non-empty.
+bool _encodeJpeg(String path, int width, int height, Uint8List rgb) {
+  final ppmPath = p.join(File(path).parent.path, '.${p.basename(path)}.ppm');
+  final header = Uint8List.fromList(ascii.encode('P6\n$width $height\n255\n'));
+  final bytes = BytesBuilder(copy: false)
+    ..add(header)
+    ..add(rgb);
+  try {
+    File(ppmPath).writeAsBytesSync(bytes.takeBytes(), flush: true);
+    final ppm = cv.imread(ppmPath, flags: cv.IMREAD_COLOR);
+    try {
+      if (ppm.isEmpty) return false;
+      if (!cv.imwrite(path, ppm)) return false;
+    } finally {
+      ppm.dispose();
+    }
+  } catch (_) {
+    return false;
+  } finally {
+    try {
+      File(ppmPath).deleteSync();
+    } catch (_) {}
+  }
+  final out = File(path);
+  return out.existsSync() && out.lengthSync() > 0;
 }
 
 int _lerp4(int c00, int c10, int c01, int c11, double du, double dv) =>

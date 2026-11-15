@@ -1,13 +1,21 @@
-"""Reproducible geometry check for the 3DoF sphere capture.
+"""Reproducible geometry check for the 3DoF sphere capture (38 targets).
 
-Calculates, for a target layout and a camera field of view, the spherical
-coverage the layout actually produces. This is the evidence behind the claim
-that 38 directions cover the sphere at the device's measured FOV, and the
-sensitivity table shows how much margin there is on a narrower lens.
+Calculates, for the 38-target layout and a vertical field of view, the
+spherical coverage the layout actually produces. This is the evidence behind
+the claim that 38 directions cover the sphere at the device's lens, and the
+sensitivity table shows how much margin there is on a narrower one.
 
 It is deliberately independent of the Dart code: it re-derives the layout from
 the same table and the same `sphereDirection` convention, so a change to one
 without the other shows up as a disagreement rather than passing silently.
+
+The horizontal FOV is never an independent input. It is derived from the
+vertical FOV and the saved photograph's portrait 3:4 aspect:
+
+    hfov = 2 * atan(tan(vfov / 2) * width / height)   # width/height = 3/4
+
+which is exactly what `sphere_intrinsics.dart` computes for the decoded
+image, so the report, the live overlay and the stitcher cannot disagree.
 
 Usage:
     python tool/sphere_coverage_report.py
@@ -29,16 +37,19 @@ import sys
 import numpy as np
 
 # ── layouts ────────────────────────────────────────────────────────────────
-# The 38-target layout the app builds: 12 per ring at 30 deg, rings at 0/+45/
-# -45, zenith at id 13, nadir at 38.
+# The 38-target layout the app builds: 12 per ring at 30 deg, rings at 0/+35/
+# -35, zenith at id 13, nadir at 38. Mirrors `kSphereRingPitchDeg`.
+RING_PITCH_DEG = 35.0
+
+
 def layout38():
     middle = [0, 30, 60, 90, 120, 150, 180, -150, -120, -90, -60, -30]
     upper = [-30, -60, -90, -120, -150, 180, 150, 120, 90, 60, 30, 0]
     lower = list(middle)
     out = [(y, 0) for y in middle]
     out.append((0, 90))
-    out += [(y, 45) for y in upper]
-    out += [(y, -45) for y in lower]
+    out += [(y, RING_PITCH_DEG) for y in upper]
+    out += [(y, -RING_PITCH_DEG) for y in lower]
     out.append((0, -90))
     return out
 
@@ -125,17 +136,27 @@ def report(name, layout, hfov, vfov, quiet=False):
     triple = (row_w[:, None] * (hits >= 3)).sum() / total
 
     # Redundancy per frame: how much of its own footprint another frame covers.
+    # `neighbour_overlap` is the stricter, more useful figure: the worst frame's
+    # overlap with its single *best* neighbour (the seam the stitcher actually
+    # blends across). Both are fractions of the frame's own footprint.
     worst, worst_id = 1.0, 0
+    worst_neighbour = 1.0
+    worst_neighbour_id = 0
     for i, R in enumerate(mats):
         pts = frame_footprint(R, hfov, vfov)
         covered_by_others = np.zeros(len(pts), bool)
+        best_single = 0.0
         for j, R2 in enumerate(mats):
             if i == j:
                 continue
-            covered_by_others |= contains(R2, pts, hfov, vfov)
+            covered_by = contains(R2, pts, hfov, vfov)
+            covered_by_others |= covered_by
+            best_single = max(best_single, covered_by.mean())
         frac = covered_by_others.mean()
         if frac < worst:
             worst, worst_id = frac, i + 1
+        if best_single < worst_neighbour:
+            worst_neighbour, worst_neighbour_id = best_single, i + 1
 
     ok = single >= 0.995 and worst >= 0.05
     if not quiet:
@@ -143,27 +164,45 @@ def report(name, layout, hfov, vfov, quiet=False):
             f"{name:<10} {len(layout):>3}  {hfov:5.2f}x{vfov:5.2f}  "
             f"{single * 100:6.2f}  {double * 100:6.2f}  {triple * 100:6.2f}  "
             f"{worst * 100:6.1f} (#{worst_id:<2})  "
+            f"{worst_neighbour * 100:6.1f} (#{worst_neighbour_id:<2})  "
             f"{'PASS' if ok else 'FAIL: ' + ('hole' if single < 0.995 else 'thin overlap')}"
         )
-    return ok, single, double, triple, worst
+    return ok, single, double, triple, worst, worst_neighbour
 
 
 def main():
-    cases = [
-        (53.13, 67.38),  # measured still (3072x4096, 26 mm-equivalent)
-        (45.0, 65.0),
-        (40.0, 55.0),
-        (35.0, 50.0),
-        (30.0, 40.0),
-    ]
+    # Vertical FOVs to evaluate. 65° is the app's documented ASSUMED value
+    # (26 mm-equivalent portrait still); the others bracket the plausible
+    # range of phone main lenses to show where the 38-target arrangement
+    # stops covering the sphere. Horizontal FOV is derived from the 3:4
+    # portrait still in every case, never specified independently.
+    portrait_aspect = 3 / 4
+
+    def hfov_of(vfov_deg: float) -> float:
+        return 2 * math.degrees(
+            math.atan(math.tan(math.radians(vfov_deg) / 2) * portrait_aspect)
+        )
+
+    vfov_cases = [65.0, 60.0, 55.0, 50.0, 45.0, 40.0]
     print(
-        f"{'layout':<10} {'n':>3}  {'FOV h x v':>11}  "
-        f"{'single':>6}  {'double':>6}  {'triple':>6}  {'redund.':>9}  verdict"
+        f"{'layout':<10} {'n':>3}  {'vfov':>5}  {'hfov(3:4)':>9}  "
+        f"{'single':>7}  {'double':>7}  {'triple':>7}  {'uncovered':>9}  "
+        f"{'redund.':>12}  {'min-nbr':>10}  verdict"
     )
     failures = 0
     for layout_name, layout in (("38-target", layout38()), ("26-baseline", layout26())):
-        for hfov, vfov in cases:
-            ok, *_ = report(layout_name, layout, hfov, vfov)
+        for vfov in vfov_cases:
+            hfov = hfov_of(vfov)
+            ok, single, double_, triple, worst, neighbour = report(
+                layout_name, layout, hfov, vfov, quiet=True
+            )
+            print(
+                f"{layout_name:<10} {len(layout):>3}  {vfov:5.1f}  {hfov:9.2f}  "
+                f"{single * 100:6.2f}%  {double_ * 100:6.2f}%  "
+                f"{triple * 100:6.2f}%  {(1 - single) * 100:8.2f}%  "
+                f"{worst * 100:10.1f}%  {neighbour * 100:8.1f}%  "
+                f"{'PASS' if ok else 'FAIL'}"
+            )
             if not ok:
                 failures += 1
         print()

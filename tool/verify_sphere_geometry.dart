@@ -96,13 +96,13 @@ void main() {
   );
   check('zenith is id 13', targets[12].isZenith && targets[12].targetId == 13);
   check(
-    'upper ring is ids 14-25 at +45',
+    'upper ring is ids 14-25 at +35',
     targets
         .sublist(13, 25)
         .every((SphereTargetSpec t) => t.pitchDeg == kSphereRingPitchDeg),
   );
   check(
-    'lower ring is ids 26-37 at -45',
+    'lower ring is ids 26-37 at -35',
     targets
         .sublist(25, 37)
         .every((SphereTargetSpec t) => t.pitchDeg == -kSphereRingPitchDeg),
@@ -173,8 +173,8 @@ void main() {
       elevation(level.rotate(sphereDirection(0, -90))),
     ];
     closeTo('rolled start: middle ring stays level', rings[0], 0, 1e-9);
-    closeTo('rolled start: upper ring stays at +45', rings[1], 45, 1e-9);
-    closeTo('rolled start: lower ring stays at -45', rings[2], -45, 1e-9);
+    closeTo('rolled start: upper ring stays at +35', rings[1], 35, 1e-9);
+    closeTo('rolled start: lower ring stays at -35', rings[2], -35, 1e-9);
     closeTo('rolled start: zenith stays at +90', rings[3], 90, 1e-9);
     closeTo('rolled start: nadir stays at -90', rings[4], -90, 1e-9);
   }
@@ -261,29 +261,32 @@ void main() {
     // A positive rotation about world East lifts the optical axis; the sign
     // matters, and getting it wrong is how a "tilt up" test silently tests a
     // tilt down.
-    final up = (Quat.axisAngle(45, Vec3.unitX) * levelNorth).normalized;
+    final up = (Quat.axisAngle(kSphereRingPitchDeg, Vec3.unitX) * levelNorth)
+        .normalized;
     closeTo(
-      'tilting up 45° centres the upper-ring target above the start heading',
+      'tilting up 35° centres the upper-ring target above the start heading',
       reticleErrorDeg(
         cameraDirection(up, sphereDirection(0, kSphereRingPitchDeg), level),
       ),
       0,
       1e-6,
     );
-    final down = (Quat.axisAngle(-45, Vec3.unitX) * levelNorth).normalized;
+    final down =
+        (Quat.axisAngle(-kSphereRingPitchDeg, Vec3.unitX) * levelNorth)
+            .normalized;
     closeTo(
-      'tilting down 45° centres the lower-ring target',
+      'tilting down 35° centres the lower-ring target',
       reticleErrorDeg(
         cameraDirection(down, sphereDirection(0, -kSphereRingPitchDeg), level),
       ),
       0,
       1e-6,
     );
-    // The horizon is 45° away at that point, which is why the ring step is 45°.
+    // The horizon is 35° away at that point, which is why the ring step is 35°.
     closeTo(
-      'at the upper ring the horizon sits 45° below centre',
+      'at the upper ring the horizon sits 35° below centre',
       reticleErrorDeg(cameraDirection(up, front, level)),
-      45,
+      35,
       1e-6,
     );
     check(
@@ -340,30 +343,64 @@ void main() {
   print('\n=== 8. Stitching overlap stays sufficient ===');
   {
     // The stitcher does not need *consecutive* frames to overlap — it needs
-    // every direction of the sphere to be covered. The 90° pole steps have no
-    // horizontal overlap by definition, and are bridged by the ring frame that
-    // follows them. What must not happen is a frame with no neighbour close
-    // enough to blend with, which is what leaves a seam nobody can hide.
-    var worstNeighbour = 0.0;
+    // every direction of the sphere to be covered. What must not happen is a
+    // frame with no neighbour inside its own frustum, which is what leaves a
+    // seam nobody can hide.
+    //
+    // The test is frustum-aware, not a flat angle: a pole's nearest neighbour
+    // is *vertical*, where a 3:4 portrait frame is widest (65° vfov), so
+    // judging it against the 51° horizontal fov would reject a perfectly
+    // overlapped zenith. Reach is computed in tangent space along the bearing
+    // to the neighbour — the same rule the coverage report uses.
+    const hfov = 51.08; // 65° vfov at 3:4 portrait
+    double reachDeg(SphereTargetSpec from, SphereTargetSpec to) {
+      final basisRight = from.direction.cross(const Vec3(0, 0, 1));
+      final right = basisRight.length < 1e-6
+          ? const Vec3(1, 0, 0)
+          : basisRight.normalized;
+      final up = from.direction.cross(right).normalized;
+      final d = to.direction;
+      final bearing = math.atan2(d.dot(up), d.dot(right));
+      final halfW = math.tan(hfov * math.pi / 360);
+      final halfH = math.tan(kSphereAssumedVerticalFovDeg * math.pi / 360);
+      final c = math.cos(bearing).abs();
+      final s = math.sin(bearing).abs();
+      final r = math.min(
+        c < 1e-9 ? double.infinity : halfW / c,
+        s < 1e-9 ? double.infinity : halfH / s,
+      );
+      return math.atan(r) * 180 / math.pi;
+    }
+
+    var tightestMargin = double.infinity;
     var worstId = 0;
+    var worstDetail = '';
     for (final target in targets) {
-      var nearest = 180.0;
+      // This frame's best overlap margin over all neighbours; the worst
+      // frame on the sphere is the one whose best margin is smallest.
+      var bestMargin = double.negativeInfinity;
+      var bestAngle = 180.0;
       for (final other in targets) {
         if (identical(other, target)) continue;
-        nearest = math.min(
-          nearest,
-          angleBetweenDeg(target.direction, other.direction),
-        );
+        final angle = angleBetweenDeg(target.direction, other.direction);
+        final combined = reachDeg(target, other) + reachDeg(other, target);
+        final margin = combined - angle;
+        if (margin > bestMargin) {
+          bestMargin = margin;
+          bestAngle = angle;
+        }
       }
-      if (nearest > worstNeighbour) {
-        worstNeighbour = nearest;
+      if (bestMargin < tightestMargin) {
+        tightestMargin = bestMargin;
         worstId = target.targetId;
+        worstDetail = 'nearest ${bestAngle.toStringAsFixed(1)}°';
       }
     }
     check(
-      'every frame has a neighbour within a 50° horizontal field of view',
-      worstNeighbour < 50,
-      'worst is target $worstId at ${worstNeighbour.toStringAsFixed(1)}°',
+      'every frame overlaps at least one neighbour inside its frustum',
+      tightestMargin > 0,
+      'tightest is target $worstId: $worstDetail, margin '
+      '${tightestMargin.toStringAsFixed(1)}° of combined reach',
     );
     closeTo(
       'a 30° ring step keeps 40% overlap',
@@ -373,9 +410,9 @@ void main() {
       '',
     );
     closeTo(
-      'a 45° ring transition keeps 10% overlap',
-      estimatedOverlapFraction(45),
-      0.1,
+      'a 35° ring transition keeps 30% overlap',
+      estimatedOverlapFraction(35),
+      0.3,
       1e-9,
       '',
     );

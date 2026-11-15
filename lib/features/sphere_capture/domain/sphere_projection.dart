@@ -51,8 +51,6 @@ class SphereProjection {
 
   double get _tanHalfVertical => math.tan(verticalFovDeg * degToRad / 2);
 
-  double get _tanHalfHorizontal => _tanHalfVertical * (width / height);
-
   /// Focal length in pixels along the screen's vertical axis.
   double get focalLengthY => (height / 2) / _tanHalfVertical;
 
@@ -61,16 +59,17 @@ class SphereProjection {
       focalLengthY * math.tan(kSphereAlignmentToleranceDeg * degToRad);
 
   /// Projects a camera-frame direction, or `null` when it is not in front.
+  ///
+  /// Delegates to the pure [projectToViewport] so the drawn marker and the
+  /// tested maths cannot diverge.
   Offset? project(Vec3 cameraDirection) {
-    final v = cameraDirection.normalized;
-    final depth = -v.z;
-    // At or behind the image plane there is no finite projection. The small
-    // epsilon keeps a target exactly at 90° from producing a huge coordinate
-    // that a painter would then draw at the edge as if it were in view.
-    if (depth <= 1e-4 || width <= 0 || height <= 0) return null;
-    final x = (v.x / depth) / _tanHalfHorizontal;
-    final y = (v.y / depth) / _tanHalfVertical;
-    return Offset(width / 2 + x * (width / 2), height / 2 - y * (height / 2));
+    final p = projectToViewport(
+      cameraDirection,
+      width: width,
+      height: height,
+      verticalFovDeg: verticalFovDeg,
+    );
+    return p == null ? null : Offset(p.x, p.y);
   }
 
   /// Whether a projected point is inside the viewport, with an optional

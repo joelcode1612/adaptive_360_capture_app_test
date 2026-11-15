@@ -85,3 +85,87 @@ double estimatedOverlapFraction(
   if (horizontalFovDeg <= 0) return 0;
   return (1 - separationDeg / horizontalFovDeg).clamp(0.0, 1.0);
 }
+
+/// The pinhole projection of a camera-frame direction onto a viewport, in
+/// pure Dart — the same maths [SphereProjection] draws with, exposed here so
+/// the viewfinder geometry and the middle-ring positioning are testable
+/// without `dart:ui` (see `tool/verify_sphere_viewfinder.dart`).
+///
+/// `+X` is screen-right, `+Y` screen-up, the camera looks along `−Z`, so
+/// `x = W/2 + (vx / −vz)·f` and `y = H/2 − (vy / −vz)·f` with
+/// `f = (H/2) / tan(vfov/2)`. Returns `null` when the direction is at or
+/// behind the image plane, or when the viewport has no area.
+({double x, double y})? projectToViewport(
+  Vec3 cameraDirection, {
+  required double width,
+  required double height,
+  required double verticalFovDeg,
+}) {
+  if (width <= 0 || height <= 0 || verticalFovDeg <= 0) return null;
+  final v = cameraDirection.normalized;
+  final depth = -v.z;
+  // At or behind the image plane there is no finite projection. The small
+  // epsilon keeps a target exactly at 90° from producing a huge coordinate
+  // that a painter would then draw at the edge as if it were in view.
+  if (depth <= 1e-4) return null;
+  final focal = (height / 2) / math.tan(verticalFovDeg * degToRad / 2);
+  return (
+    x: width / 2 + focal * v.x / depth,
+    y: height / 2 - focal * v.y / depth,
+  );
+}
+
+/// The largest portrait 3:4 box that fits inside an available area.
+///
+/// The live capture viewfinder is exactly this: the camera's 3:4 frame shown
+/// undistorted, with the toolbar and controls outside it. Width-limited on a
+/// tall phone, height-limited on a short one — never stretched, and never
+/// taller than 4/3 of its width.
+({double width, double height}) fitPortraitThreeFour({
+  required double availableWidth,
+  required double availableHeight,
+}) {
+  const aspect = 3 / 4; // width / height
+  if (availableWidth <= 0 || availableHeight <= 0) {
+    return (width: 0, height: 0);
+  }
+  final byWidth = availableWidth;
+  final byWidthHeight = availableWidth / aspect;
+  if (byWidthHeight <= availableHeight) {
+    return (width: byWidth, height: byWidthHeight);
+  }
+  return (width: availableHeight * aspect, height: availableHeight);
+}
+
+/// The vertical field of view that is actually visible inside a viewfinder of
+/// [viewfinderAspect] when the camera frame has [cameraVerticalFovDeg] and
+/// [frameAspect].
+///
+/// Both aspects are portrait width/height. The preview is laid out with
+/// `BoxFit.cover`, so a frame **taller** than the viewfinder (frameAspect <
+/// viewfinderAspect, e.g. a 9:16 preview stream in a 3:4 box) keeps its width
+/// and is cropped top and bottom: the visible vertical span shrinks by the
+/// ratio of the aspects in the tangent domain. A frame **wider** than the
+/// viewfinder keeps its full height and is cropped at the sides, so the
+/// vertical field of view is unchanged.
+///
+/// This is the crop transform the marker overlay must use. Projecting the
+/// camera's full vertical FOV onto a cropped viewfinder would draw every
+/// off-axis marker at the wrong distance from the reticle — the failure looks
+/// exactly like "the middle ring sits too high" once the phone is tilted at
+/// all, because the error scales with the angle.
+double visibleVerticalFovDeg({
+  required double cameraVerticalFovDeg,
+  required double frameAspect,
+  required double viewfinderAspect,
+}) {
+  if (cameraVerticalFovDeg <= 0 || cameraVerticalFovDeg >= 180) {
+    return cameraVerticalFovDeg;
+  }
+  if (frameAspect <= 0 || viewfinderAspect <= 0) return cameraVerticalFovDeg;
+  final visibleFraction = frameAspect < viewfinderAspect
+      ? frameAspect / viewfinderAspect
+      : 1.0;
+  final tanHalf = math.tan(cameraVerticalFovDeg * degToRad / 2);
+  return 2 * math.atan(tanHalf * visibleFraction) * radToDeg;
+}

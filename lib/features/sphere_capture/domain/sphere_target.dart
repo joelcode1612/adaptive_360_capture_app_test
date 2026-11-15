@@ -34,8 +34,8 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vecto
 //
 // ids 1–12:  Middle Ring, pitch 0°,   yaw 0°, 30°, … 330°
 // id 13:     Zenith,      pitch +90°
-// ids 14–25: Upper Ring,  pitch +45°, yaw −30°, −60°, … 0° (reverse sweep)
-// ids 26–37: Lower Ring,  pitch −45°, yaw 0°, 30°, … 330°
+// ids 14–25: Upper Ring,  pitch +35°, yaw −30°, −60°, … 0° (reverse sweep)
+// ids 26–37: Lower Ring,  pitch −35°, yaw 0°, 30°, … 330°
 // id 38:     Nadir,       pitch −90°
 //
 // ## Why 38 and not 26
@@ -47,14 +47,17 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vecto
 // is a few degrees wide, so a 1–2° orientation error shows as a visible step.
 //
 // Twelve per ring puts the yaw step at 30°, i.e. 44% horizontal overlap. Rings
-// at ±45° put the vertical and pole gaps at 45°, i.e. 33% overlap against the
-// 67° vertical field of view. The ring order is a continuous path (middle →
-// zenith → upper → lower → nadir) so every guided step is at most 120°, and no
-// pair of neighbours is below ~30% overlap.
+// at ±35° put the vertical ring gap at 35° (≈46% overlap against the 65°
+// assumed vertical field of view) while the pole gap is 55° (≈15% overlap).
+// That spacing clears the 99.5% coverage gate at the assumed lens with margin
+// (100.00% single coverage at 65°, 99.76% at 60°); a genuinely 55° lens would
+// not cover it — see tool/sphere_coverage_report.py. The ring order is a
+// continuous path (middle → zenith → upper → lower → nadir) so every guided
+// step is at most 90°.
 //
 // The upper ring sweeps backwards so it starts at the yaw where the middle ring
-// ended; that is what keeps the middle → upper step at 45° instead of the 52° a
-// jump back to yaw 0° would cost.
+// ended; that is what keeps the middle → upper step at 35° instead of the
+// larger jump a return to yaw 0° would cost.
 
 /// How many directions a complete sphere has.
 const int kSphereTargetCount = 38;
@@ -62,10 +65,12 @@ const int kSphereTargetCount = 38;
 /// The vertical field of view **assumed** for the rear camera, in degrees.
 ///
 /// The `camera` plugin does not expose intrinsics on Android, so this is a
-/// documented assumption rather than a measurement. It is declared once and
-/// consumed by both the live overlay ([SphereProjection]) and the stitcher
-/// (`EquirectangularStitcher` derives its focal length from it), so the aiming
-/// graphics and the panorama cannot disagree about the lens.
+/// documented assumption rather than a measurement — no code path may present
+/// it as measured. It is declared once and consumed by both the live overlay
+/// ([SphereProjection]) and the stitcher (`EquirectangularStitcher` derives its
+/// focal length from it), so the aiming graphics and the panorama cannot
+/// disagree about the lens. The horizontal FOV is never hard-coded anywhere:
+/// it is always derived from the image dimensions and this vertical value.
 ///
 /// Calibration evidence: the saved still is 3072 × 4096 with a 4.94 mm lens,
 /// which is the device's 26 mm-equivalent main camera — about 50–53° horizontal
@@ -73,16 +78,26 @@ const int kSphereTargetCount = 38;
 /// it makes the stitcher's frames slightly narrower than they are, so a
 /// coverage check errs toward reporting a hole rather than hiding one.
 ///
-/// **Do not tune this per device.** If a real intrinsics path is added later,
-/// replace this constant with the reported value and both consumers follow.
-const double kSphereAssumedVerticalFovDeg = 65;
+/// **Device validation without touching geometry:** override at build time
+/// with `--dart-define=sphereVerticalFovDeg=61` (whole degrees — enough for
+/// lens validation) once a device's lens has been measured. The target
+/// layout, IDs and capture sequence are unaffected. If a real intrinsics
+/// path is added later, replace this constant with the reported value and
+/// both consumers follow.
+const int _kSphereFovOverride = int.fromEnvironment(
+  'sphereVerticalFovDeg',
+  defaultValue: 0,
+);
+const double kSphereAssumedVerticalFovDeg = _kSphereFovOverride > 0
+    ? _kSphereFovOverride * 1.0
+    : 65;
 
 /// The nominal capture radius. The sphere is a direction set, so the radius is
 /// documentation and future 3D previews rather than a placement input.
 const double kSphereRadiusM = 1.0;
 
 /// Elevation of the upper and lower rings, in degrees.
-const double kSphereRingPitchDeg = 45;
+const double kSphereRingPitchDeg = 35;
 
 /// The alignment cone that turns a target green and starts the hold ring.
 const double kSphereAlignmentToleranceDeg = 5;
@@ -190,7 +205,7 @@ List<SphereTargetSpec> buildSphereTargets() {
     -30,
   ];
   // Reverse sweep: starts at the yaw the middle ring ended on (−30°) and walks
-  // back to 0°, so the ring transition is 45° rather than 52°.
+  // back to 0°, so the ring transition is 35° rather than a longer jump.
   const List<double> upperYaws = <double>[
     -30,
     -60,
@@ -241,7 +256,7 @@ List<SphereTargetSpec> buildSphereTargets() {
 
   addRing(middleYaws, 0, 'Middle Ring');
 
-  // The zenith sits between the hemispheres: 90° up from the horizon, then 45°
+  // The zenith sits between the hemispheres: 90° up from the horizon, then 55°
   // back down to the upper ring. After the lower ring it would be 135° away
   // from the next target — a jump no guided path should ask for.
   id++;
@@ -279,7 +294,7 @@ List<SphereTargetSpec> buildSphereTargets() {
 /// ## Why this exists
 ///
 /// The layout says the middle ring is the **horizon** (pitch 0°) and the other
-/// rings are 45° above and below it. That is only true if the frame the ring is
+/// rings are 35° above and below it. That is only true if the frame the ring is
 /// measured in has the world's up axis as its own up axis. Seeding the sphere
 /// from the first raw sensor sample does not: the phone is normally held tilted
 /// while the user reaches for **Start**, so the whole sphere inherits that tilt

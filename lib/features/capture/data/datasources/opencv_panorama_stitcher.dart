@@ -46,9 +46,7 @@ class OpenCvPanoramaStitcher implements PanoramaStitcher {
     );
     onStage?.call('Stitching ${imagePaths.length} photographs…');
     try {
-      final result = await Isolate.run(
-        () => _stitchInIsolate(imagePaths, outPath),
-      );
+      final result = await _stitchOnIsolate(imagePaths, outPath);
       if (!result.ok) return StitchResult.failure(result.message);
       return StitchResult(
         success: true,
@@ -60,6 +58,18 @@ class OpenCvPanoramaStitcher implements PanoramaStitcher {
     }
   }
 }
+
+/// Launches [_stitchInIsolate] on a background isolate.
+///
+/// Top-level on purpose: the closure captures only this function's parameters
+/// (the image paths and the output path). Writing the launch inline inside
+/// `stitchFrames` made Dart capture that method's whole context — including
+/// its `onStage` callback, which closes over the calling Flutter screen — and
+/// the isolate message then failed with "unsendable".
+Future<({bool ok, String message})> _stitchOnIsolate(
+  List<String> imagePaths,
+  String outPath,
+) => Isolate.run(() => _stitchInIsolate(imagePaths, outPath));
 
 /// The OpenCV work, on a background isolate.
 ///
