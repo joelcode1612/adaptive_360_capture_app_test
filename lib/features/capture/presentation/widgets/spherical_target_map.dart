@@ -46,21 +46,34 @@ class SphericalTargetMap extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: size,
-      height: size,
-      child: GestureDetector(
-        onTapDown: (TapDownDetails d) {
-          final id = _hitTest(d.localPosition, size);
-          if (id != null) onSelect(id);
-        },
-        child: CustomPaint(
-          painter: _SpherePainter(
-            specs: specs,
-            statuses: _statuses(),
-            activeTargetId: activeTargetId,
-            tiltDeg: tiltDeg,
-            showLabels: showLabels,
+    final statuses = _statuses();
+    final saved = statuses.where((CaptureTargetStatus s) => s.isDone).length;
+    return Semantics(
+      // The map is a picture of the same list the target sheet renders below
+      // it, so a screen reader gets the count here and the per-target rows
+      // there — rather than twenty-six anonymous shapes.
+      image: true,
+      label:
+          'Target map: $saved of ${specs.length} photographs saved. '
+          'The list below names every target.',
+      child: ExcludeSemantics(
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: GestureDetector(
+            onTapDown: (TapDownDetails d) {
+              final id = _hitTest(d.localPosition, size);
+              if (id != null) onSelect(id);
+            },
+            child: CustomPaint(
+              painter: _SpherePainter(
+                specs: specs,
+                statuses: statuses,
+                activeTargetId: activeTargetId,
+                tiltDeg: tiltDeg,
+                showLabels: showLabels,
+              ),
+            ),
           ),
         ),
       ),
@@ -82,7 +95,7 @@ class SphericalTargetMap extends StatelessWidget {
     final sinT = math.sin(tilt);
 
     var bestId = 0;
-    var bestDistance = 26.0;
+    var bestDistance = 30.0;
     for (final spec in specs) {
       final d = spec.direction;
       final y = d.y * cosT - d.z * sinT;
@@ -218,7 +231,7 @@ class _SpherePainter extends CustomPainter {
       final color = switch (status) {
         CaptureTargetStatus.captured => CaptureColors.ok,
         CaptureTargetStatus.failed => CaptureColors.danger,
-        CaptureTargetStatus.aligned => CaptureColors.accent,
+        CaptureTargetStatus.aligned => CaptureColors.accentOnDark,
         CaptureTargetStatus.active => CaptureColors.warn,
         // A shutter request is in flight: the same amber as "you are on this
         // one", because it is still the active target and the photograph has
@@ -231,31 +244,31 @@ class _SpherePainter extends CustomPainter {
       if (isActive) {
         canvas.drawCircle(
           p,
-          11,
+          13,
           Paint()
             ..color = CaptureColors.warn.withValues(alpha: 0.28)
             ..style = PaintingStyle.fill,
         );
         canvas.drawCircle(
           p,
-          11,
+          13,
           Paint()
             ..color = CaptureColors.warn
             ..style = PaintingStyle.stroke
-            ..strokeWidth = 1.5,
+            ..strokeWidth = 2,
         );
       }
 
       canvas.drawCircle(
         p,
-        isActive ? 6 : 5,
+        isActive ? 7.5 : 6,
         Paint()
           ..color = color.withValues(alpha: alpha)
           ..style = PaintingStyle.fill,
       );
       canvas.drawCircle(
         p,
-        isActive ? 6 : 5,
+        isActive ? 7.5 : 6,
         Paint()
           ..color = Colors.black.withValues(alpha: front ? 0.35 : 0.2)
           ..style = PaintingStyle.stroke

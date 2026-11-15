@@ -7,12 +7,24 @@ import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_p
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 
-/// Paints the 38 projected targets, the fixed reticle and the hold ring.
+/// Paints the 38 projected targets, the aiming ring and the hold arc.
 ///
 /// Repaints directly from the controller ([CustomPainter.repaint]) so a 50 Hz
 /// sensor stream does not rebuild any widget: only this canvas is repainted.
 /// That is what keeps the camera preview and the rest of the tree at 60 FPS
 /// while the sphere follows the phone.
+///
+/// ## Draw order is a correctness property, not a style choice
+///
+/// 1. every captured and pending marker, **except** the selected one;
+/// 2. the aiming ring;
+/// 3. the selected marker, **on top of** the ring;
+/// 4. the off-screen arrow.
+///
+/// The selected marker used to be skipped as soon as it came within the old
+/// opaque plate, so the target the user was aligning vanished exactly when it
+/// was about to be captured. Drawing it last means the user can watch it enter
+/// the ring, which is the whole visual contract of an automatic shutter.
 class SphereOverlayPainter extends CustomPainter {
   SphereOverlayPainter({required this.controller, required this.projection})
     : super(repaint: controller);
@@ -21,26 +33,21 @@ class SphereOverlayPainter extends CustomPainter {
   final SphereProjection projection;
 
   /// Marker radius in logical pixels, scaled to the viewport and clamped.
-  ///
-  /// About 14 px on a 443-logical-pixel-wide phone — roughly double the
-  /// previous 8 px pending marker, which the device recording showed as
-  /// barely visible. The clamp keeps a tablet from getting dinner-plate
-  /// markers while still scaling up on a large phone.
   double get _baseRadius =>
-      (math.min(projection.width, projection.height) * 0.032).clamp(14.0, 24.0);
+      (math.min(projection.width, projection.height) * 0.030).clamp(13.0, 22.0);
 
-  /// Radius of the centre aiming plate, in logical pixels.
+  /// Radius of the aiming ring, in logical pixels.
   ///
-  /// **The plate edge is the 5° alignment cone.** That is what makes the
-  /// reference design's big white circle functional rather than decorative:
-  /// a target under the plate is inside the shutter's tolerance, so the green
-  /// wedge is filling; a target outside it keeps its own marker and hairline.
-  /// A larger plate would hide targets that are close but not yet aligned.
-  double get _plateRadius => projection.toleranceRadiusPx.clamp(60.0, 118.0);
-
-  double get _ringRadius => _plateRadius * 0.44;
-
-  double get _ringWidth => _plateRadius * 0.11;
+  /// **This radius is the 5° capture cone**, not a decoration: a target centre
+  /// inside this circle is inside the shutter's tolerance, so the ring fills.
+  /// That is what lets the user predict the shutter instead of guessing.
+  ///
+  /// The clamp is a sanity floor/ceiling only — it is deliberately wide enough
+  /// never to bite on a real phone viewport, because a ring drawn larger than
+  /// the cone would invite the user to stop turning while the shutter is still
+  /// shut. The capture gate itself always uses the true 3-D angle and never
+  /// reads this number.
+  double get _aimRadius => projection.toleranceRadiusPx.clamp(24.0, 160.0);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -51,22 +58,54 @@ class SphereOverlayPainter extends CustomPainter {
         controller.activeErrorDeg <= controller.toleranceDeg &&
         controller.phase == SphereCapturePhase.ready;
 
-    _paintTargets(canvas, device, start, activeId, aligned);
-    _paintReticle(canvas);
+    // Project first, draw second. The selected point has to be known *before*
+    // any captured marker is drawn, so a finished target sitting on top of the
+    // current one can fade instead of competing with it.
+    final projected = _projectTargets(device, start);
+    Offset? activePoint;
+    for (final entry in projected) {
+      if (entry.target.spec.targetId == activeId) {
+        activePoint = entry.point;
+        break;
+      }
+    }
+
+    for (final entry in projected) {
+      if (entry.target.spec.targetId == activeId) continue;
+      if (entry.target.captured) {
+        final near =
+            activePoint != null &&
+            (entry.point - activePoint).distance < _baseRadius * 3.4;
+        _paintCaptured(canvas, entry.point, nearActive: near);
+      } else {
+        _paintPending(canvas, entry.point);
+      }
+    }
+
+    _paintAimingRing(canvas, aligned: aligned);
+
+    if (activePoint != null && activeId != null) {
+      _paintActive(
+        canvas,
+        activePoint,
+        targetId: activeId,
+        aligned: aligned,
+        progress: controller.holdProgress,
+      );
+    }
     _paintGuideArrow(canvas, device, start);
   }
 
-  void _paintTargets(
-    Canvas canvas,
+  /// Every target that is currently in front of the camera and near enough to
+  /// the viewport to be worth drawing.
+  List<({SphereTargetState target, Offset point})> _projectTargets(
     Quat? device,
     Quat? start,
-    int? activeId,
-    bool aligned,
   ) {
-    if (device == null || start == null) return;
-    final toleranceRadius = projection.toleranceRadiusPx;
-    final center = Offset(projection.width / 2, projection.height / 2);
-
+    if (device == null || start == null) {
+      return const <({SphereTargetState target, Offset point})>[];
+    }
+    final out = <({SphereTargetState target, Offset point})>[];
     for (final target in controller.targets) {
       final direction = sphereTargetCameraDirection(
         deviceToWorld: device,
@@ -75,59 +114,35 @@ class SphereOverlayPainter extends CustomPainter {
       );
       final point = projection.project(direction);
       if (point == null) continue;
-      if (!projection.isOnScreen(point, margin: 48)) continue;
-
-      final isActive = target.spec.targetId == activeId;
-      final error = isActive
-          ? controller.activeErrorDeg
-          : reticleErrorDeg(direction);
-      // A target is "in the cone" when it is inside the same angle the shutter
-      // uses. Drawing it green before the gate agrees would be a lie.
-      final inCone = error <= controller.toleranceDeg;
-
-      if (target.captured) {
-        _paintCaptured(canvas, point);
-        continue;
-      }
-
-      // The centre plate represents the target being aimed at; drawing its
-      // marker underneath an opaque plate would be invisible ink.
-      if (isActive && (point - center).distance < _plateRadius) continue;
-
-      if (isActive) {
-        _paintActive(
-          canvas,
-          point,
-          targetId: target.spec.targetId,
-          aligned: aligned && inCone,
-          progress: controller.holdProgress,
-          toleranceRadius: toleranceRadius,
-        );
-      } else {
-        _paintPending(canvas, point, inCone: inCone);
-      }
+      if (!projection.isOnScreen(point, margin: 40)) continue;
+      out.add((target: target, point: point));
     }
+    return out;
   }
 
-  void _paintCaptured(Canvas canvas, Offset point) {
-    final radius = _baseRadius * 0.85;
+  void _paintCaptured(Canvas canvas, Offset point, {required bool nearActive}) {
+    final radius = _baseRadius * 0.78;
+    // A finished target must never compete with the one being aimed at, so it
+    // fades back when it happens to sit on top of the selected marker.
+    final alpha = nearActive ? 0.30 : 0.90;
     canvas.drawCircle(
       point,
       radius,
-      Paint()..color = CaptureColors.ok.withValues(alpha: 0.9),
+      Paint()..color = CaptureColors.ok.withValues(alpha: alpha),
     );
     canvas.drawCircle(
       point,
       radius,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.6
-        ..color = Colors.white.withValues(alpha: 0.8),
+        ..strokeWidth = 1.4
+        ..color = Colors.white.withValues(alpha: nearActive ? 0.3 : 0.75),
     );
+    if (nearActive) return;
     // A small tick, so "captured" survives a colour-blind palette too.
     final tick = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = radius * 0.18
+      ..strokeWidth = radius * 0.20
       ..strokeCap = StrokeCap.round
       ..color = Colors.white;
     canvas.drawLine(
@@ -142,25 +157,27 @@ class SphereOverlayPainter extends CustomPainter {
     );
   }
 
-  void _paintPending(Canvas canvas, Offset point, {required bool inCone}) {
+  /// A target that is not the selected one.
+  ///
+  /// Deliberately **never** tinted green, even when it happens to sit under the
+  /// reticle. Only the selected target can be captured, so a green ring on any
+  /// other marker would advertise a shutter that will never fire — which is
+  /// exactly what made "the arrow and the automatic capture pick different
+  /// targets" look true.
+  void _paintPending(Canvas canvas, Offset point) {
     final radius = _baseRadius;
     canvas.drawCircle(
       point,
       radius,
-      Paint()
-        ..color = inCone
-            ? CaptureColors.ok.withValues(alpha: 0.35)
-            : Colors.black.withValues(alpha: 0.28),
+      Paint()..color = Colors.black.withValues(alpha: 0.26),
     );
     canvas.drawCircle(
       point,
       radius,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2
-        ..color = inCone
-            ? CaptureColors.ok
-            : Colors.white.withValues(alpha: 0.8),
+        ..strokeWidth = 1.8
+        ..color = Colors.white.withValues(alpha: 0.78),
     );
   }
 
@@ -170,15 +187,17 @@ class SphereOverlayPainter extends CustomPainter {
     required int targetId,
     required bool aligned,
     required double progress,
-    required double toleranceRadius,
   }) {
     final radius = _baseRadius * 1.55;
     final ringRadius = _baseRadius * 2.05;
     final colour = aligned ? CaptureColors.ok : Colors.white;
+
+    // A dark core keeps the white ring and the number readable over a bright
+    // window without hiding the scene the way the old opaque plate did.
     canvas.drawCircle(
       point,
       radius,
-      Paint()..color = Colors.black.withValues(alpha: 0.35),
+      Paint()..color = Colors.black.withValues(alpha: 0.42),
     );
     canvas.drawCircle(
       point,
@@ -190,17 +209,16 @@ class SphereOverlayPainter extends CustomPainter {
     );
 
     if (progress > 0) {
-      final arc = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 5
-        ..strokeCap = StrokeCap.round
-        ..color = CaptureColors.ok;
       canvas.drawArc(
         Rect.fromCircle(center: point, radius: ringRadius),
         -math.pi / 2,
         2 * math.pi * progress.clamp(0.0, 1.0),
         false,
-        arc,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 4.5
+          ..strokeCap = StrokeCap.round
+          ..color = CaptureColors.ok,
       );
     }
 
@@ -211,8 +229,9 @@ class SphereOverlayPainter extends CustomPainter {
         text: '$targetId',
         style: TextStyle(
           color: Colors.white,
-          fontSize: radius * 0.8,
+          fontSize: radius * 0.82,
           fontWeight: FontWeight.w700,
+          height: 1,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -222,91 +241,123 @@ class SphereOverlayPainter extends CustomPainter {
     // A hairline from the reticle to the active target makes the turn
     // direction legible at a glance when the marker is near the edge.
     final center = Offset(projection.width / 2, projection.height / 2);
-    final distance = (point - center).distance;
-    if (distance > toleranceRadius + 12 && distance < 420) {
+    final delta = point - center;
+    final distance = delta.distance;
+    if (distance > _aimRadius + 10 && distance < 460) {
+      final unit = delta / distance;
       canvas.drawLine(
-        center + (point - center) / distance * (toleranceRadius + 6),
-        point - (point - center) / distance * (radius * 1.2),
+        center + unit * (_aimRadius + 4),
+        point - unit * (radius * 1.15),
         Paint()
           ..strokeWidth = 1.2
-          ..color = Colors.white.withValues(alpha: 0.2),
+          ..color = Colors.white.withValues(alpha: 0.22),
       );
     }
   }
 
-  /// The centre aiming plate: a white disc, a grey ring and a green wedge.
+  /// The centre aiming ring: a visible circle with a **transparent interior**.
   ///
-  /// This is the reference design's target plate used as the reticle: the
-  /// white disc is the aim point, the grey ring is the target's bezel, and the
-  /// green wedge fills with [SphereCaptureController.holdProgress] while the
-  /// active target is inside the 5° cone. The wedge therefore means "the
-  /// shutter is arming", not merely "a target exists".
-  void _paintReticle(Canvas canvas) {
+  /// It used to be a 93%-opaque white disc. That disc covered the middle of the
+  /// viewfinder — the one part of the frame the user is aiming — and a target
+  /// approaching the centre disappeared behind it. A ring keeps the aim point
+  /// unmistakable while leaving the scene, and the incoming marker, visible.
+  ///
+  /// Three states are drawn from real controller state, never from a timer:
+  /// the green arc is [SphereCaptureController.holdProgress], the ring turns
+  /// green when the target is inside the 5° cone, and the centre dot is the
+  /// exact optical axis.
+  void _paintAimingRing(Canvas canvas, {required bool aligned}) {
     final center = Offset(projection.width / 2, projection.height / 2);
-    final plate = _plateRadius;
-    final ring = _ringRadius;
-    final ringWidth = _ringWidth;
-
-    canvas.drawCircle(
-      center,
-      plate,
-      Paint()..color = Colors.white.withValues(alpha: 0.93),
-    );
-    canvas.drawCircle(
-      center,
-      plate,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.2
-        ..color = Colors.black.withValues(alpha: 0.10),
-    );
-    canvas.drawCircle(
-      center,
-      ring,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = ringWidth
-        ..color = const Color(0xFF6F7C88),
-    );
-
+    final radius = _aimRadius;
     final progress = controller.holdProgress.clamp(0.0, 1.0);
-    if (progress > 0) {
-      final inner = ring - ringWidth / 2;
-      final wedge = Path()
-        ..moveTo(center.dx, center.dy)
-        ..arcTo(
-          Rect.fromCircle(center: center, radius: inner),
-          -math.pi / 2,
-          2 * math.pi * progress,
-          false,
-        )
-        ..close();
-      canvas.drawPath(wedge, Paint()..color = CaptureColors.ok);
+
+    // Dark halo first, so the ring survives a white wall or a bright window.
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 4.6
+        ..color = Colors.black.withValues(alpha: 0.22),
+    );
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.2
+        ..color = aligned
+            ? CaptureColors.ok
+            : Colors.white.withValues(alpha: 0.94),
+    );
+
+    // A second, fainter ring at 62% reads as a sight rather than a bubble.
+    canvas.drawCircle(
+      center,
+      radius * 0.62,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.0
+        ..color = Colors.white.withValues(alpha: 0.26),
+    );
+
+    // Four cardinal ticks sit outside the ring so they never cover the marker.
+    final tick = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..strokeCap = StrokeCap.round
+      ..color = Colors.white.withValues(alpha: 0.85);
+    for (var i = 0; i < 4; i++) {
+      final angle = i * math.pi / 2;
+      final direction = Offset(math.cos(angle), math.sin(angle));
+      canvas.drawLine(
+        center + direction * (radius + 3),
+        center + direction * (radius + 9),
+        tick,
+      );
     }
 
-    final aligned =
-        controller.activeErrorDeg <= controller.toleranceDeg &&
-        controller.phase == SphereCapturePhase.ready;
-    if (aligned) {
-      canvas.drawCircle(
-        center,
-        ring + ringWidth / 2 + 2,
+    if (progress > 0) {
+      canvas.drawArc(
+        Rect.fromCircle(center: center, radius: radius),
+        -math.pi / 2,
+        2 * math.pi * progress,
+        false,
         Paint()
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2
+          ..strokeWidth = 4.5
+          ..strokeCap = StrokeCap.round
           ..color = CaptureColors.ok,
       );
     }
 
-    canvas.drawCircle(center, 2.5, Paint()..color = const Color(0xFF6F7C88));
+    if (aligned) {
+      canvas.drawCircle(
+        center,
+        radius + 5,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6
+          ..color = CaptureColors.ok.withValues(alpha: 0.55),
+      );
+    }
+
+    canvas.drawCircle(
+      center,
+      2.6,
+      Paint()..color = Colors.black.withValues(alpha: 0.35),
+    );
+    canvas.drawCircle(center, 1.8, Paint()..color = Colors.white);
   }
 
-  /// An edge arrow to the next frame in the stitch path.
+  /// An edge arrow to the selected target while it is outside the viewfinder.
   ///
-  /// Only drawn when the guide target is outside the safe area (or behind the
-  /// camera); an on-screen target is already visible as a marker with the
-  /// hairline from the reticle. The arrow carries the live turn angle, so the
-  /// user can follow it without reading the pill.
+  /// With 30° ring spacing and a ~50° horizontal field of view, the next target
+  /// is normally **outside** the screen while the current one is centred — the
+  /// specification is explicit that this is expected and must not be papered
+  /// over by moving the target. So the arrow is the primary instruction: it
+  /// carries the live turn angle and the direction, and disappears the moment
+  /// the real marker is on screen and the hairline takes over.
   void _paintGuideArrow(Canvas canvas, Quat? device, Quat? start) {
     if (controller.phase != SphereCapturePhase.ready) return;
     final guide = controller.guideTarget;
@@ -325,16 +376,25 @@ class SphereOverlayPainter extends CustomPainter {
       projection.height - 210,
     );
     final center = Offset(projection.width / 2, projection.height / 2);
-    if (point != null && safe.contains(point)) return;
+    if (point != null && !controller.guideBehind && safe.contains(point)) {
+      return;
+    }
 
     final Offset bearing;
-    if (point != null) {
+    if (point != null && !controller.guideBehind) {
       bearing = point - center;
     } else {
-      // Behind the camera: there is no projection, so use the horizontal and
-      // vertical components directly. A target exactly behind has no bearing
-      // at all; pointing right is the honest "turn to find it" default.
-      bearing = Offset(direction.x, -direction.y);
+      // Behind the camera there is no projection at all. The horizontal part is
+      // taken from the *signed turn angle* rather than from `direction.x`,
+      // because `x` collapses to zero exactly when the target is behind — which
+      // is when the arrow matters most. A target dead astern has no preferred
+      // way round, and "turn right" is the honest 180° answer.
+      final turn = controller.guideTurnDeg;
+      final pitchRad = controller.guidePitchDeg * math.pi / 180;
+      bearing = Offset(
+        turn.abs() < 1e-3 ? 1 : (turn > 0 ? 1 : -1),
+        -math.sin(pitchRad),
+      );
     }
     final length = bearing.distance;
     if (length < 1e-6) return;
@@ -373,16 +433,15 @@ class SphereOverlayPainter extends CustomPainter {
       textDirection: TextDirection.ltr,
     )..layout();
     final labelCenter = tip - unit * 34;
-    final background = RRect.fromRectAndRadius(
-      Rect.fromCenter(
-        center: labelCenter,
-        width: label.width + 12,
-        height: label.height + 6,
-      ),
-      const Radius.circular(9),
-    );
     canvas.drawRRect(
-      background,
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(
+          center: labelCenter,
+          width: label.width + 12,
+          height: label.height + 6,
+        ),
+        const Radius.circular(9),
+      ),
       Paint()..color = Colors.black.withValues(alpha: 0.55),
     );
     label.paint(

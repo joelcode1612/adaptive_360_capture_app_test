@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,10 +8,12 @@ import 'package:path/path.dart' as p;
 
 import 'package:adaptive_360_capture_app/features/capture/application/panorama_generation_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/stitch/incremental_stitch_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_record.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/capture/presentation/screens/ar_capture_flow_screen.dart';
+import 'package:adaptive_360_capture_app/features/capture/presentation/widgets/stitching_results_panel.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 
 /// Local photograph review and 360° preview for one finished capture station.
@@ -27,11 +30,18 @@ class CaptureReviewScreen extends StatefulWidget {
     required this.repository,
     required this.stationId,
     required this.stitcher,
+    this.stitchService,
   });
 
   final CaptureRepository repository;
   final String stationId;
   final PanoramaStitcher stitcher;
+
+  /// The live incremental-stitch verifier shared with the capture flow. When
+  /// provided, the Stitching Results section renders below the panorama;
+  /// without it (older callers, some tests) the section is omitted and the
+  /// screen behaves exactly as before.
+  final IncrementalStitchService? stitchService;
 
   @override
   State<CaptureReviewScreen> createState() => _CaptureReviewScreenState();
@@ -54,6 +64,13 @@ class _CaptureReviewScreenState extends State<CaptureReviewScreen> {
   void initState() {
     super.initState();
     _reload();
+    // The service exposes a single change callback; the flow screen held it
+    // while capturing, and this screen takes it over for the review phase.
+    widget.stitchService?.onChanged = _onStitchChanged;
+  }
+
+  void _onStitchChanged() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _reload() async {
@@ -120,6 +137,8 @@ class _CaptureReviewScreenState extends State<CaptureReviewScreen> {
       _stage = 'Validating frames...';
       _error = null;
     });
+    final service = widget.stitchService;
+    unawaited(service?.beginFinalPanorama());
     try {
       final records = await widget.repository.loadRecords(widget.stationId);
       final result = await PanoramaGenerationService(widget.stitcher).generate(
@@ -129,6 +148,15 @@ class _CaptureReviewScreenState extends State<CaptureReviewScreen> {
           if (mounted) setState(() => _stage = stage);
         },
       );
+      if (service != null) {
+        unawaited(
+          service.completeFinalPanorama(
+            success: result.success && result.panoramaPath != null,
+            panoramaPath: result.panoramaPath,
+            errorReason: result.success ? null : result.message,
+          ),
+        );
+      }
       if (!mounted) return;
       if (!result.success || result.panoramaPath == null) {
         setState(() {
@@ -221,7 +249,7 @@ class _CaptureReviewScreenState extends State<CaptureReviewScreen> {
               _panorama == null ? 'Retry stitching' : 'Regenerate panorama',
             ),
             style: OutlinedButton.styleFrom(
-              foregroundColor: CaptureColors.accent,
+              foregroundColor: CaptureColors.accentOnDark,
               side: const BorderSide(color: CaptureColors.accent),
             ),
           ),
@@ -235,6 +263,15 @@ class _CaptureReviewScreenState extends State<CaptureReviewScreen> {
               side: const BorderSide(color: CaptureColors.hairlineOnDark),
             ),
           ),
+          if (widget.stitchService != null) ...[
+            const SizedBox(height: 16),
+            StitchingResultsPanel(
+              service: widget.stitchService!,
+              specs: _specs,
+              onRetake: _retake,
+              thumbnailFor: _thumbnailFor,
+            ),
+          ],
           const SizedBox(height: 16),
           Text(
             'Photographs (${_records.length}/${_specs.length})',
@@ -392,4 +429,8 @@ class _CaptureReviewScreenState extends State<CaptureReviewScreen> {
     }
     return null;
   }
+
+  /// The captured frame's path for a target — the stitching panel's row
+  /// thumbnails show the photograph, not the stitch.
+  String? _thumbnailFor(int targetId) => _recordFor(targetId)?.imagePath;
 }

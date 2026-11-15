@@ -1,13 +1,19 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 
 import 'package:adaptive_360_capture_app/features/capture/application/panorama_generation_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/stitch/incremental_stitch_service.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/stitch/incremental_stitch_worker.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_record.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/datasources/opencv_panorama_stitcher.dart';
 import 'package:adaptive_360_capture_app/features/capture/presentation/screens/ar_capture_screen.dart';
 import 'package:adaptive_360_capture_app/features/capture/presentation/screens/capture_review_screen.dart';
+import 'package:adaptive_360_capture_app/features/capture/presentation/widgets/stitching_results_panel.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 
 /// The standalone 26-target workflow host: capture → validate → stitch →
@@ -56,7 +62,10 @@ class StitchHandoff {
   final Future<List<CaptureRecord>> Function() loadRecords;
   final VoidCallback onStarted;
   final void Function(String stage) onStage;
-  final VoidCallback onSuccess;
+
+  /// Called with the generated panorama's absolute path — the final result is
+  /// verified by [PanoramaGenerationService] before this fires.
+  final void Function(String panoramaPath) onSuccess;
   final void Function(String message) onFailure;
 
   bool _running = false;
@@ -80,7 +89,7 @@ class StitchHandoff {
         onFailure(result.message);
         return;
       }
-      onSuccess();
+      onSuccess(result.panoramaPath!);
     } catch (error) {
       _running = false;
       onFailure('The panorama could not be generated: $error');
@@ -102,6 +111,12 @@ class _ArCaptureFlowScreenState extends State<ArCaptureFlowScreen> {
 
   StitchHandoff? _handoff;
 
+  /// The incremental per-image stitching verifier. Created here — the flow
+  /// screen outlives both the capture and review screens, so one instance
+  /// serves the whole session and the persisted JSON keeps it consistent
+  /// across restarts.
+  IncrementalStitchService? _stitchService;
+
   late final PanoramaStitcher _stitcher =
       widget.stitcher ?? OpenCvPanoramaStitcher();
 
@@ -117,14 +132,28 @@ class _ArCaptureFlowScreenState extends State<ArCaptureFlowScreen> {
     if (!mounted) return;
     final stationId =
         widget.stationId ?? 'station-${DateTime.now().millisecondsSinceEpoch}';
+    final stitchService = IncrementalStitchService(
+      stationId: stationId,
+      resolveStationDir: () => _resolveStationDirectory(repository, stationId),
+      loadRecords: () => repository.loadRecords(stationId),
+      worker: runIncrementalStitchJob,
+      onChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
+    // Persisted results (previous session) load before anything reads them;
+    // onCaptureSaved also awaits this, so the ordering is safe either way.
+    unawaited(stitchService.load());
     setState(() {
       _repository = repository;
       _stationId = stationId;
+      _stitchService = stitchService;
       _handoff = StitchHandoff(
         service: PanoramaGenerationService(_stitcher),
         total: buildCaptureSphere().length,
         loadRecords: () => repository.loadRecords(stationId),
         onStarted: () {
+          unawaited(stitchService.beginFinalPanorama());
           if (mounted) {
             setState(() {
               _stitching = true;
@@ -135,7 +164,13 @@ class _ArCaptureFlowScreenState extends State<ArCaptureFlowScreen> {
         onStage: (String stage) {
           if (mounted) setState(() => _stage = stage);
         },
-        onSuccess: () {
+        onSuccess: (String panoramaPath) {
+          unawaited(
+            stitchService.completeFinalPanorama(
+              success: true,
+              panoramaPath: panoramaPath,
+            ),
+          );
           if (!mounted) return;
           setState(() => _stitching = false);
           Navigator.of(context).pushReplacement(
@@ -144,11 +179,18 @@ class _ArCaptureFlowScreenState extends State<ArCaptureFlowScreen> {
                 repository: repository,
                 stationId: stationId,
                 stitcher: _stitcher,
+                stitchService: stitchService,
               ),
             ),
           );
         },
         onFailure: (String message) {
+          unawaited(
+            stitchService.completeFinalPanorama(
+              success: false,
+              errorReason: message,
+            ),
+          );
           if (mounted) {
             // The banner carries the reason and a Retry: the photographs are
             // still on disk, so nothing needs recapturing.
@@ -161,6 +203,23 @@ class _ArCaptureFlowScreenState extends State<ArCaptureFlowScreen> {
       );
       _preparing = false;
     });
+  }
+
+  /// The station's on-disk directory, recovered from a saved record's frame
+  /// path (`…/<stationId>/frames/tNN.jpg`) — the same derivation the review
+  /// screen uses for `panorama.json`, so the layout convention lives in one
+  /// place. `null` until the first photograph exists, which the service
+  /// handles by deferring persistence.
+  Future<String?> _resolveStationDirectory(
+    CaptureRepository repository,
+    String stationId,
+  ) async {
+    final records = await repository.loadRecords(stationId);
+    for (final CaptureRecord record in records) {
+      final frames = p.dirname(record.imagePath);
+      if (p.basename(frames) == 'frames') return p.dirname(frames);
+    }
+    return null;
   }
 
   /// Called by [CaptureModuleScreen] when its controller reports every target
@@ -186,8 +245,17 @@ class _ArCaptureFlowScreenState extends State<ArCaptureFlowScreen> {
         CaptureModuleScreen(
           repository: repository,
           stationId: stationId,
+          stitchService: _stitchService,
           onComplete: _onCaptureComplete,
         ),
+        // Live incremental-stitching status, one tappable line. Deliberately
+        // at the bottom edge, away from the reticle and the target guidance.
+        if (_stitchService != null)
+          Positioned(
+            left: 16,
+            bottom: _stitching || _stage != null ? 92 : 28,
+            child: StitchingStatusStrip(service: _stitchService!),
+          ),
         if (_stitching || _stage != null)
           Positioned(
             left: 16,
@@ -249,7 +317,7 @@ class _StitchingBanner extends StatelessWidget {
             onPressed: onRetry,
             child: const Text(
               'Retry',
-              style: TextStyle(color: CaptureColors.accent),
+              style: TextStyle(color: CaptureColors.accentOnDark),
             ),
           ),
       ],

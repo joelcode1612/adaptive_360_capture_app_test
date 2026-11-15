@@ -166,7 +166,7 @@ class _StartScreen extends StatelessWidget {
               children: [
                 const Icon(
                   Icons.threesixty,
-                  color: CaptureColors.accent,
+                  color: CaptureColors.accentOnDark,
                   size: 26,
                 ),
                 const SizedBox(width: 8),
@@ -204,9 +204,10 @@ class _StartScreen extends StatelessWidget {
             ),
             const SizedBox(height: 10),
             const Text(
-              'A sphere of $kSphereTargetCount targets follows the phone. Turn '
-              'to bring each target into the centre reticle, hold steady, and '
-              'the photograph is taken automatically.',
+              'Hold the phone level and face the first wall, then tap Start. '
+              'The $kSphereTargetCount targets are levelled to gravity — turn '
+              'to bring the next one into the centre ring and the photograph '
+              'is taken automatically.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: CaptureColors.mutedOnDark,
@@ -265,8 +266,8 @@ class _StartScreen extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             const Text(
-              '3DoF rotation only · no calibration · the sphere is locked to '
-              'the phone',
+              '3DoF rotation only · levelled to gravity at Start · the sphere '
+              'stays locked to the room',
               textAlign: TextAlign.center,
               style: TextStyle(color: CaptureColors.mutedOnDark, fontSize: 11),
             ),
@@ -792,6 +793,12 @@ class _PanoramaStatus extends StatelessWidget {
           ),
           TextButton(
             onPressed: controller.retryStitching,
+            style: TextButton.styleFrom(
+              // The app's default theme is the light one, so a text button on
+              // this dark screen has to name its own colour.
+              foregroundColor: CaptureColors.linkOnDark,
+              minimumSize: const Size(0, CaptureMetrics.minTouchTarget),
+            ),
             child: const Text('Retry stitching'),
           ),
         ],

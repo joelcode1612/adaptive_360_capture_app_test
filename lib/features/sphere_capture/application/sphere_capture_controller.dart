@@ -3,6 +3,7 @@
 // constructor reads `rotation:` rather than `_rotation:`.
 // ignore_for_file: prefer_initializing_formals
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' show AppLifecycleState;
@@ -24,6 +25,7 @@ import 'package:adaptive_360_capture_app/features/sphere_capture/data/jpeg_norma
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/motion_detector.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_projection.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/scalars.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/platform/rotation_sensor.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/platform/sphere_camera.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
@@ -161,6 +163,9 @@ class SphereCaptureController extends ChangeNotifier {
   int? _guideTargetId;
   double _guideSeparationDeg = 180;
   double _guideErrorDeg = 180;
+  double _guideTurnDeg = 0;
+  double _guidePitchDeg = 0;
+  bool _guideBehind = false;
   bool _moving = false;
   bool _capturing = false;
   bool _stitching = false;
@@ -239,13 +244,14 @@ class SphereCaptureController extends ChangeNotifier {
   /// The station directory name, for the export manifest and diagnostics.
   String get stationId => _stationId;
 
-  /// The target the arrow points at: the next frame in the stitch path.
+  /// The target the arrow points at: the next uncaptured frame in the stitch
+  /// path.
   ///
-  /// This is deliberately not the same thing as [activeTarget]. The active
-  /// target is whatever the user is pointing at right now and owns the hold
-  /// ring; the guide target is the adjacent uncaptured direction that keeps
-  /// consecutive photographs overlapping. Following the arrow therefore also
-  /// keeps the panorama stitchable.
+  /// This **is** [activeTarget]. They were once two different things — the
+  /// arrow followed the stitch order while the shutter fired for whatever was
+  /// nearest the reticle — which let the UI highlight one target and capture
+  /// another. One field now drives the arrow, the pill, the hold ring and the
+  /// shutter, so they cannot disagree.
   SphereTargetState? get guideTarget {
     final id = _guideTargetId;
     if (id == null) return null;
@@ -267,6 +273,34 @@ class SphereCaptureController extends ChangeNotifier {
   /// The current angle between the guide target and the centre reticle.
   double get guideErrorDeg => _guideErrorDeg;
 
+  /// Signed horizontal angle from the reticle to the guide target, in degrees.
+  ///
+  /// Positive is to the user's **right**, so the guidance can say "turn right
+  /// 30°" instead of "follow the arrow (30°)" — the sign is what the arrow used
+  /// to carry alone. It is already the shortest way round: `atan2` returns
+  /// (−180°, +180°], so a target 170° clockwise is "right 170", not "left 190".
+  double get guideTurnDeg => _guideTurnDeg;
+
+  /// Signed vertical angle to the guide target, in degrees, positive up.
+  double get guidePitchDeg => _guidePitchDeg;
+
+  /// Whether the guide target is behind the camera, where it cannot be drawn.
+  bool get guideBehind => _guideBehind;
+
+  /// Where the phone is currently looking, expressed in the frozen start
+  /// device frame — the same frame the target directions live in.
+  ///
+  /// This is what lets the mini-map show "you are here" against the fixed
+  /// sphere, so the user can see that turning is closing the gap rather than
+  /// having to infer it from the arrow.
+  Vec3? get lookDirectionInStartFrame {
+    final device = _deviceToWorld;
+    final start = _startDeviceToWorld;
+    if (device == null || start == null) return null;
+    final world = device.rotate(const Vec3(0, 0, -1));
+    return start.conjugate.rotate(world).normalized;
+  }
+
   /// `Target 1 / 38 — Middle Ring (0°)`, or the completion sentence.
   String get progressLabel {
     final target = guideTarget ?? activeTarget;
@@ -277,6 +311,13 @@ class SphereCaptureController extends ChangeNotifier {
   }
 
   /// The sentence above the progress pill.
+  ///
+  /// It names the turn in the words the user actually needs — "Turn right 30°"
+  /// — because the arrow is only unambiguous once the target is on screen, and
+  /// with 30° ring spacing and a ~50° horizontal field of view the next target
+  /// is usually *outside* it while the current one is centred. The wording is
+  /// derived from the same angle the shutter uses, so it cannot drift from the
+  /// capture gate.
   String get guidance {
     if (_phase == SphereCapturePhase.failed) {
       return _message ?? 'The camera could not start.';
@@ -293,15 +334,31 @@ class SphereCaptureController extends ChangeNotifier {
     final target = guideTarget ?? activeTarget;
     if (target == null) return 'Hold the phone steady.';
     if (_activeErrorDeg <= toleranceDeg) {
-      return 'Hold steady — capturing '
-          '${activeTarget?.spec.shortName ?? target.spec.shortName}.';
+      return 'Hold steady — capturing ${target.spec.shortName}.';
     }
-    final warning = guideOverlapFraction < 0.05
-        ? ' Almost no overlap with the previous frame — the panorama may '
-              'seam here.'
-        : '';
-    return 'Follow the arrow to ${target.spec.shortName} '
-        '(${_guideErrorDeg.toStringAsFixed(0)}°).$warning';
+    final name = target.spec.shortName;
+    // Coarse turns are horizontal; once the bearing is close, the remaining
+    // error is usually vertical and "tilt up" is the useful instruction.
+    final String move;
+    if (_guideTurnDeg.abs() >= 12) {
+      move =
+          'Turn ${_guideTurnDeg > 0 ? 'right' : 'left'} '
+          '${_guideTurnDeg.abs().round()}°';
+    } else if (_guidePitchDeg.abs() >= 8) {
+      move =
+          'Tilt ${_guidePitchDeg > 0 ? 'up' : 'down'} '
+          '${_guidePitchDeg.abs().round()}°';
+    } else {
+      move =
+          'Turn ${_guideTurnDeg >= 0 ? 'right' : 'left'} '
+          '${_activeErrorDeg.round()}°';
+    }
+    // No overlap warning here. The two 90° pole steps genuinely share nothing
+    // with their predecessor, but they are bridged by the ring frame that
+    // follows, and telling the user the panorama "may seam" mid-capture is an
+    // alarm they cannot act on. `guideOverlapFraction` stays available for
+    // diagnostics.
+    return '$move to $name.';
   }
 
   /// Starts permissions, camera and rotation stream.
@@ -325,6 +382,9 @@ class SphereCaptureController extends ChangeNotifier {
     _guideTargetId = null;
     _guideSeparationDeg = 180;
     _guideErrorDeg = 180;
+    _guideTurnDeg = 0;
+    _guidePitchDeg = 0;
+    _guideBehind = false;
     _galleryPath = null;
     _notify();
     try {
@@ -369,61 +429,91 @@ class SphereCaptureController extends ChangeNotifier {
       return;
     }
     _deviceToWorld = quaternion;
-    _startDeviceToWorld ??= quaternion;
+    // The sphere's reference frame is the start pose **levelled**: heading kept,
+    // pitch and roll dropped. Seeding it from the raw first sample baked the
+    // phone's tilt at the instant Start was pressed into every target, so the
+    // "horizon" ring was not the horizon and every marker sat at the same
+    // constant angle off the room while still tracking the phone correctly.
+    //
+    // `worldUp` comes from the source, not from a constant here: Android
+    // reports East–North–Up (`+Z` up) while this project's pose helpers use
+    // `+Y`. Levelling with the wrong axis turns the "yaw" into a roll and tilts
+    // every ring by 90°. See [levelStartFrame].
+    final worldUp = _rotation.worldUp;
+    _startDeviceToWorld ??= levelStartFrame(quaternion, worldUp: worldUp);
     final start = _startDeviceToWorld;
-    if (start == null) return;
+    if (start == null) {
+      // The phone is pointing too close to straight up or down for a heading to
+      // exist. Freezing a reference here would tilt the whole station, so the
+      // calibration waits — and says so — instead of guessing.
+      _message =
+          'Point the phone towards the room — not straight down or straight '
+          'up — so the sphere has a horizon to sit on.';
+      _notify();
+      return;
+    }
     if (!_loggedFirstSample) {
       _loggedFirstSample = true;
+      // The tilt that levelling removed, so a device log can confirm the sphere
+      // started level rather than inheriting the phone's angle at Start.
+      final removedTiltDeg = cameraElevationDeg(quaternion, worldUp: worldUp);
       debugPrint(
         'SPHERE_SENSOR: first rotation '
         'q=(${quaternion.x.toStringAsFixed(4)}, '
         '${quaternion.y.toStringAsFixed(4)}, '
         '${quaternion.z.toStringAsFixed(4)}, '
-        '${quaternion.w.toStringAsFixed(4)})',
+        '${quaternion.w.toStringAsFixed(4)}) '
+        'start tilt removed=${removedTiltDeg.toStringAsFixed(1)}° '
+        'worldUp=(${worldUp.x.toStringAsFixed(0)},'
+        '${worldUp.y.toStringAsFixed(0)},'
+        '${worldUp.z.toStringAsFixed(0)})',
       );
     }
 
     final now = _clock();
-    SphereTargetState? nearest;
-    var nearestError = 180.0;
-    for (final target in _targets) {
-      if (target.captured) continue;
+
+    // **One target, one decision.** The target the arrow points at, the target
+    // the pill names, the target whose ring fills and the target the shutter
+    // fires for are the same object. They used to be two: the arrow followed
+    // the stitch order while the shutter fired for whatever was nearest the
+    // reticle, so a user could see "Target 5" highlighted and have target 3
+    // captured. With a fixed id order the first uncaptured target is also
+    // target 1 at the start of a station, which is what makes the first
+    // photograph compulsory and horizon-level.
+    final active = guideTarget;
+    var activeError = 180.0;
+    var turnDeg = 0.0;
+    var pitchDeg = 0.0;
+    var behind = false;
+    if (active != null) {
       final direction = sphereTargetCameraDirection(
         deviceToWorld: quaternion,
         startDeviceToWorld: start,
-        startDirection: target.spec.direction,
+        startDirection: active.spec.direction,
       );
-      final error = reticleErrorDeg(direction);
-      if (error < nearestError) {
-        nearestError = error;
-        nearest = target;
-      }
+      activeError = reticleErrorDeg(direction);
+      // Horizontal bearing in the camera frame. The camera looks along `−z`, so
+      // a target to the user's right has `x > 0` and `atan2(x, −z)` is a
+      // positive angle — the sign the guidance needs to say "turn right".
+      turnDeg = math.atan2(direction.x, -direction.z) * radToDeg;
+      pitchDeg = math.asin(clampDouble(direction.y, -1, 1)) * radToDeg;
+      behind = direction.z > 0;
     }
 
-    _activeTargetId = nearest?.spec.targetId;
-    _activeErrorDeg = nearestError;
+    _activeTargetId = active?.spec.targetId;
+    _activeErrorDeg = activeError;
+    _guideErrorDeg = activeError;
+    _guideTurnDeg = turnDeg;
+    _guidePitchDeg = pitchDeg;
+    _guideBehind = behind;
 
-    // The guide target is independent of what the user is aiming at: it is the
-    // next frame in the overlap-preserving stitch path. Its live error is what
-    // the guidance sentence and the edge arrow report.
-    final guide = guideTarget;
-    if (guide != null) {
-      _guideErrorDeg = reticleErrorDeg(
-        sphereTargetCameraDirection(
-          deviceToWorld: quaternion,
-          startDeviceToWorld: start,
-          startDirection: guide.spec.direction,
-        ),
-      );
-    }
-
-    if (nearest != null && _phase == SphereCapturePhase.ready) {
-      if (_holdTargetId != nearest.spec.targetId) {
-        _holdTargetId = nearest.spec.targetId;
+    if (active != null && _phase == SphereCapturePhase.ready) {
+      if (_holdTargetId != active.spec.targetId) {
+        _holdTargetId = active.spec.targetId;
         _holdProgress = 0;
         _lastSampleAt = now;
       }
-      if (nearestError <= toleranceDeg) {
+      if (activeError <= toleranceDeg) {
         final last = _lastSampleAt;
         final dtSeconds = last == null
             ? 0.0
@@ -433,9 +523,9 @@ class SphereCaptureController extends ChangeNotifier {
             (_holdProgress + dtSeconds / (holdDuration.inMilliseconds / 1000))
                 .clamp(0.0, 1.0);
         if (_holdProgress >= 1.0 && !_capturing) {
-          unawaited(_capture(nearest));
+          unawaited(_capture(active));
         }
-      } else if (nearestError > exitToleranceDeg) {
+      } else if (activeError > exitToleranceDeg) {
         _holdProgress = 0;
         _lastSampleAt = now;
       } else {
@@ -493,8 +583,8 @@ class SphereCaptureController extends ChangeNotifier {
         anchored: false,
         imageWidth: normalized.width,
         imageHeight: normalized.height,
-        sourceImageWidth: normalized.width,
-        sourceImageHeight: normalized.height,
+        sourceImageWidth: normalized.sourceWidth,
+        sourceImageHeight: normalized.sourceHeight,
         imageFormat: 'jpeg',
         toleranceDeg: toleranceDeg,
       );
@@ -686,15 +776,43 @@ class SphereCaptureController extends ChangeNotifier {
 
   /// Chooses the next target in the capture path and measures its overlap.
   ///
-  /// The order is the layout's own: middle ring, upper ring, lower ring, then
-  /// the poles. That is the sequence the progress pill counts through, so the
-  /// arrow and the pill cannot disagree.
+  /// ## The route
+  ///
+  /// The order is the layout's own: middle ring, zenith, upper ring, lower
+  /// ring, nadir. That is the sequence the progress pill counts through, so the
+  /// arrow and the pill cannot disagree — and it is also the shortest possible
+  /// **maximum** step, which is what keeps every guided turn predictable:
+  ///
+  /// | step | angle | why |
+  /// |---|---|---|
+  /// | within a ring | 30° | 12 targets over 360° |
+  /// | middle → zenith | 90° | a pole is 90° from *every* horizon target |
+  /// | zenith → upper | 45° | 90° − 45° |
+  /// | upper → lower | 90° | 45° above to 45° below |
+  /// | lower → nadir | 45° | 90° − 45° |
+  ///
+  /// Any route must pay at least one 90° step to reach a pole, because the
+  /// zenith is 90° from every non-pole direction. This order pays two — one per
+  /// pole — and nothing above 90°. Sweeping the upper ring *before* the zenith
+  /// would trade the 90° climb for a 135° descent to the lower ring, which is
+  /// strictly worse; that is why the zenith sits at id 13 rather than after the
+  /// upper ring.
+  ///
+  /// ## Why it also writes the active target
+  ///
+  /// `_guideTargetId` and `_activeTargetId` are two views of one decision, and
+  /// they used to be updated at different times: the guide changed the instant a
+  /// photograph was saved, while the active target waited for the next 50 Hz
+  /// rotation sample. For those ~20 ms the arrow pointed at target 5 while the
+  /// marker, pill and alignment error still described target 4. Writing both
+  /// here removes the window entirely, so "the arrow and the shutter disagree"
+  /// cannot happen even transiently.
   ///
   /// [guideSeparationDeg] is the angle from the **last captured frame's
-  /// centre** to this target — the number that decides whether the stitcher
-  /// will find matching content. Within a ring it is 30°; between rings it is
-  /// 45°, which is ~35% overlap against the camera's ~69° vertical field of
-  /// view. A 90° step only occurs at the pole and the hemisphere transition.
+  /// centre** to this target — the number that decides how much content two
+  /// consecutive frames share. At 30° within a ring it is ~40% of a 50°
+  /// horizontal field of view; at the 90° ring transitions it is 0, which is
+  /// exactly the two seams the panorama has to blend across.
   void _recomputeGuide() {
     final last = _lastCapturedDirection;
     SphereTargetState? next;
@@ -708,6 +826,36 @@ class SphereCaptureController extends ChangeNotifier {
     _guideSeparationDeg = next == null || last == null
         ? 0
         : angleBetweenDeg(last, next.spec.direction);
+
+    final device = _deviceToWorld;
+    final start = _startDeviceToWorld;
+    if (next == null || device == null || start == null) {
+      _activeTargetId = next?.spec.targetId;
+      _activeErrorDeg = 180;
+      _guideErrorDeg = 180;
+      _guideTurnDeg = 0;
+      _guidePitchDeg = 0;
+      _guideBehind = false;
+    } else {
+      final direction = sphereTargetCameraDirection(
+        deviceToWorld: device,
+        startDeviceToWorld: start,
+        startDirection: next.spec.direction,
+      );
+      _activeTargetId = next.spec.targetId;
+      _activeErrorDeg = reticleErrorDeg(direction);
+      _guideErrorDeg = _activeErrorDeg;
+      _guideTurnDeg = math.atan2(direction.x, -direction.z) * radToDeg;
+      _guidePitchDeg =
+          math.asin(clampDouble(direction.y, -1, 1)) * radToDeg;
+      _guideBehind = direction.z > 0;
+    }
+    // The new target has not been held yet. Clearing the bookkeeping rather
+    // than zeroing the progress makes the next sample start a fresh hold, which
+    // is what stops a half-filled ring carrying over from the previous target.
+    _holdTargetId = null;
+    _holdProgress = 0;
+    _lastSampleAt = null;
   }
 
   String _describe(Object error) {

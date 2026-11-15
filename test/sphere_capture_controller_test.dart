@@ -11,6 +11,7 @@ import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_station.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
+import 'package:adaptive_360_capture_app/core/permissions/permission_service.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/application/sphere_capture_controller.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/jpeg_normalizer.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
@@ -51,6 +52,10 @@ void main() {
       repository: repository,
       stitcher: stitcher,
       stationId: 's1',
+      // The real gate asks `permission_handler`, which has no implementation
+      // under `flutter test`; without this every `start()` would fall into the
+      // failure branch and no capture could ever be exercised.
+      permissions: AllowAllPermissions(),
       clock: () => now,
       haptic: () async {},
       normalize: (Uint8List bytes) async =>
@@ -120,6 +125,14 @@ void main() {
 
   test('a target outside the 5° cone never fires the shutter', () async {
     await controller.start();
+    // Calibrate first: the *first* sample defines the sphere's reference, so a
+    // test that skipped this would be measuring the calibration pose against
+    // itself and always read 0°. Target 1 is the front target, so the
+    // calibration pose is the identity.
+    rotation.emit(aimAt(controller.targets.first.spec));
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.activeErrorDeg, closeTo(0, 1e-6));
+
     final offAim = Quat.axisAngle(-22.5, Vec3.unitY);
     for (var i = 0; i < 12; i++) {
       rotation.emit(offAim);
@@ -167,6 +180,7 @@ void main() {
       await aimAndHold(aimAt(controller.targets.first.spec));
       expect(controller.capturedCount, 1);
       expect(controller.guideTargetId, 2);
+      // 30° apart on the middle ring at a ~50° horizontal field of view.
       expect(controller.guideSeparationDeg, closeTo(30, 0.5));
       expect(controller.guideOverlapFraction, closeTo(0.4, 0.02));
 
@@ -218,15 +232,163 @@ void main() {
     expect(path, 'export/s1');
     expect(controller.exportPath, 'export/s1');
   });
+
+  // The production sensor reports Android's East–North–Up frame. These tests
+  // drive that frame end to end, because the bug they guard against — levelling
+  // with `+Y` up on `+Z`-up data — is invisible in the `+Y`-up tests above.
+  group('Android ENU (Z-up) sensor frame', () {
+    const Vec3 enuUp = Vec3(0, 0, 1);
+
+    // Phone held level, facing north, portrait upright:
+    // device x → East, y → Up, z → −North.
+    final levelNorth = Quat.fromMatrix3(<double>[
+      1, 0, 0, //
+      0, 0, -1, //
+      0, 1, 0, //
+    ]);
+
+    late EnuRotationSource enu;
+    late SphereCaptureController enuController;
+
+    setUp(() {
+      enu = EnuRotationSource();
+      enuController = SphereCaptureController(
+        rotation: enu,
+        camera: camera,
+        repository: repository,
+        stitcher: stitcher,
+        stationId: 'enu',
+        permissions: AllowAllPermissions(),
+        clock: () => now,
+        haptic: () async {},
+        normalize: (Uint8List bytes) async =>
+            NormalizedJpeg(bytes: bytes, width: 3024, height: 4032),
+        export:
+            ({
+              required String stationId,
+              required List<SphereTargetState> targets,
+              required String? panoramaPath,
+            }) async => 'export/$stationId',
+      );
+    });
+
+    tearDown(() async {
+      enuController.dispose();
+      await enu.close();
+    });
+
+    test('a level start puts target 1 exactly on the reticle', () async {
+      await enuController.start();
+      enu.emit(levelNorth);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(enuController.activeTargetId, 1);
+      expect(enuController.activeErrorDeg, closeTo(0, 1e-6));
+    });
+
+    test('starting 30° down still leaves the middle ring on the horizon',
+        () async {
+      await enuController.start();
+      // Tilt down about the device's own X axis, which is East here.
+      final tilted = (levelNorth * Quat.axisAngle(-30, Vec3.unitX)).normalized;
+      enu.emit(tilted);
+      await Future<void>.delayed(Duration.zero);
+
+      // Target 1 is the horizon in the start heading, so with the phone 30°
+      // down it must sit 30° ABOVE the reticle and in front of the camera.
+      // Levelling with the wrong up axis put it 60° away with its world
+      // direction on the floor.
+      expect(enuController.activeErrorDeg, closeTo(30, 1e-6));
+      expect(enuController.guidePitchDeg, closeTo(30, 1e-6));
+      expect(enuController.guideBehind, isFalse);
+    });
+
+    test('turning right moves the fixed target to the left', () async {
+      await enuController.start();
+      enu.emit(levelNorth);
+      await Future<void>.delayed(Duration.zero);
+      expect(enuController.guideTurnDeg, closeTo(0, 1e-6));
+
+      // A right turn is a negative rotation about world up (right-handed).
+      final turned =
+          (Quat.axisAngle(-30, enuUp) * levelNorth).normalized;
+      enu.emit(turned);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(enuController.activeErrorDeg, closeTo(30, 1e-6));
+      expect(enuController.guideTurnDeg, lessThan(0));
+    });
+
+    test('the capture gate agrees with the aiming ring angle', () async {
+      await enuController.start();
+      enu.emit(levelNorth);
+      await Future<void>.delayed(Duration.zero);
+      expect(enuController.holdProgress, 0);
+
+      // 4° off: inside the 5° cone, so the hold starts filling.
+      final inside = (Quat.axisAngle(-4, enuUp) * levelNorth).normalized;
+      now = now.add(const Duration(milliseconds: 200));
+      enu.emit(inside);
+      await Future<void>.delayed(Duration.zero);
+      expect(enuController.activeErrorDeg, closeTo(4, 1e-6));
+      expect(enuController.holdProgress, greaterThan(0));
+
+      // 8° off: past the 7° exit band, so the half-filled ring is discarded.
+      final outside = (Quat.axisAngle(-8, enuUp) * levelNorth).normalized;
+      now = now.add(const Duration(milliseconds: 200));
+      enu.emit(outside);
+      await Future<void>.delayed(Duration.zero);
+      expect(enuController.holdProgress, 0);
+    });
+  });
 }
 
 // ── fakes ──────────────────────────────────────────────────────────────────
+
+/// Grants camera access without touching the platform.
+class AllowAllPermissions extends PermissionService {
+  @override
+  Future<void> ensureCapturePermissions() async {}
+
+  @override
+  Future<bool> get cameraGranted async => true;
+}
 
 class FakeRotationSource implements RotationSource {
   final StreamController<Quat> _controller = StreamController<Quat>.broadcast();
 
   @override
   Stream<Quat> get rotations => _controller.stream;
+
+  /// `+Y` up, i.e. the frame `Quat.fromYawPitch` and [aimAt] are written in.
+  ///
+  /// The production source reports Android's East–North–Up frame instead; that
+  /// path is covered separately by `EnuRotationSource` below, because a fake
+  /// that silently used the hardware's frame would make [aimAt] mean something
+  /// different from what it says.
+  @override
+  Vec3 get worldUp => Vec3.unitY;
+
+  @override
+  Future<void> start() async {}
+
+  @override
+  Future<void> stop() async {}
+
+  void emit(Quat quaternion) => _controller.add(quaternion);
+
+  Future<void> close() => _controller.close();
+}
+
+/// A source that reports Android's real East–North–Up frame (`+Z` up).
+class EnuRotationSource implements RotationSource {
+  final StreamController<Quat> _controller = StreamController<Quat>.broadcast();
+
+  @override
+  Stream<Quat> get rotations => _controller.stream;
+
+  @override
+  Vec3 get worldUp => const Vec3(0, 0, 1);
 
   @override
   Future<void> start() async {}

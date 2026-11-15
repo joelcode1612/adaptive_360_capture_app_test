@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/scalars.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 
@@ -22,7 +23,14 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vecto
 // the world, so the same quaternion serves the maths and the native sensor
 // with no handedness conversion in between.
 //
-// ## Layout (R = 1.0)
+// The *world* frame those quaternions live in is not this file's business —
+// `Quat` is frame-agnostic and `q⁻¹·(q₀·v)` cancels any change of basis. The
+// one place the world's up axis does matter is [levelStartFrame], which is why
+// it takes the axis as a parameter instead of assuming one. Android reports
+// `+Z` up (East–North–Up); this project's own pose helpers use `+Y`. Getting
+// those two confused tilts every target by 90°, so the axis is never guessed.
+//
+// ## Layout (R = 1.0) — 38 directions
 //
 // ids 1–12:  Middle Ring, pitch 0°,   yaw 0°, 30°, … 330°
 // id 13:     Zenith,      pitch +90°
@@ -32,24 +40,42 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vecto
 //
 // ## Why 38 and not 26
 //
-// The rear camera measures ~50° horizontal and ~69° vertical field of view in
-// portrait (3072 × 4096, 4.94 mm lens). At the old 45° yaw spacing, adjacent
-// frames shared only 5° — 10% overlap — and the ±30° rings left a 60° gap to
-// the poles. Both are below what a stitcher can match reliably.
+// The rear camera measures ~53° horizontal and ~67° vertical in portrait (a
+// 3072 × 4096 still). At 45° yaw spacing — the 26-target template — adjacent
+// frames share only 8°, i.e. 15% overlap, and the ±30° rings leave a 60° gap to
+// the poles. That is enough for coverage but thin for blending: the seam band
+// is a few degrees wide, so a 1–2° orientation error shows as a visible step.
 //
-// Twelve targets per ring put the yaw step at 30°, i.e. 40% horizontal
-// overlap. Rings at ±45° put the vertical and pole gaps at 45°, i.e. ~35%
-// overlap against the 69° vertical field of view. The ring order is a
-// continuous path (middle → upper → zenith → lower → nadir) so every guided
-// step is at most 45°, and the whole sphere is covered with no pair of
-// neighbours below ~35% overlap.
+// Twelve per ring puts the yaw step at 30°, i.e. 44% horizontal overlap. Rings
+// at ±45° put the vertical and pole gaps at 45°, i.e. 33% overlap against the
+// 67° vertical field of view. The ring order is a continuous path (middle →
+// zenith → upper → lower → nadir) so every guided step is at most 120°, and no
+// pair of neighbours is below ~30% overlap.
 //
-// The upper ring sweeps backwards so it starts at the yaw where the middle
-// ring ended; that is what keeps the middle → upper step at 45° instead of the
-// 52° a jump back to yaw 0° would cost.
+// The upper ring sweeps backwards so it starts at the yaw where the middle ring
+// ended; that is what keeps the middle → upper step at 45° instead of the 52° a
+// jump back to yaw 0° would cost.
 
 /// How many directions a complete sphere has.
 const int kSphereTargetCount = 38;
+
+/// The vertical field of view **assumed** for the rear camera, in degrees.
+///
+/// The `camera` plugin does not expose intrinsics on Android, so this is a
+/// documented assumption rather than a measurement. It is declared once and
+/// consumed by both the live overlay ([SphereProjection]) and the stitcher
+/// (`EquirectangularStitcher` derives its focal length from it), so the aiming
+/// graphics and the panorama cannot disagree about the lens.
+///
+/// Calibration evidence: the saved still is 3072 × 4096 with a 4.94 mm lens,
+/// which is the device's 26 mm-equivalent main camera — about 50–53° horizontal
+/// and 67–69° vertical in portrait. 65° is the conservative end of that band:
+/// it makes the stitcher's frames slightly narrower than they are, so a
+/// coverage check errs toward reporting a hole rather than hiding one.
+///
+/// **Do not tune this per device.** If a real intrinsics path is added later,
+/// replace this constant with the reported value and both consumers follow.
+const double kSphereAssumedVerticalFovDeg = 65;
 
 /// The nominal capture radius. The sphere is a direction set, so the radius is
 /// documentation and future 3D previews rather than a placement input.
@@ -66,7 +92,7 @@ const double kSphereAlignmentToleranceDeg = 5;
 /// deliberate turn must.
 const double kSphereAlignmentExitDeg = 7;
 
-/// One of the 38 directions, before any photograph exists.
+/// One of the 26 directions, before any photograph exists.
 class SphereTargetSpec {
   /// 1-based, 1…38.
   final int targetId;
@@ -140,10 +166,14 @@ Vec3 sphereDirection(double yawDeg, double pitchDeg) {
 /// Builds the fixed 38-target layout in capture order.
 ///
 /// Pure and deterministic: the id→angle mapping is asserted once in the test
-/// suite rather than re-derived per session. The order is a continuous path —
-/// middle ring, upper ring (reverse sweep), zenith, lower ring, nadir — so
-/// every guided step is at most 45° and the progress pill counts through a
-/// route the user can actually follow.
+/// suite rather than re-derived per session. The order is the sequence the
+/// progress pill counts through and the order the guide arrow follows, so the
+/// two cannot disagree.
+///
+/// Target **1 is always the middle ring at yaw 0** — the direction the user was
+/// facing when the sphere was calibrated. The controller refuses to capture
+/// anything else until it is saved, which is what makes the first photograph a
+/// known, horizon-level frame rather than whatever happened to be nearest.
 List<SphereTargetSpec> buildSphereTargets() {
   const List<double> middleYaws = <double>[
     0,
@@ -159,6 +189,8 @@ List<SphereTargetSpec> buildSphereTargets() {
     -60,
     -30,
   ];
+  // Reverse sweep: starts at the yaw the middle ring ended on (−30°) and walks
+  // back to 0°, so the ring transition is 45° rather than 52°.
   const List<double> upperYaws = <double>[
     -30,
     -60,
@@ -209,10 +241,9 @@ List<SphereTargetSpec> buildSphereTargets() {
 
   addRing(middleYaws, 0, 'Middle Ring');
 
-  // The zenith sits after the middle ring: 90° up from the horizon, then 45°
-  // back down to the upper ring. Putting it between the upper and lower rings
-  // would make the next step 135°, because the lower ring is 135° from the
-  // zenith — a jump no guided path should ask for.
+  // The zenith sits between the hemispheres: 90° up from the horizon, then 45°
+  // back down to the upper ring. After the lower ring it would be 135° away
+  // from the next target — a jump no guided path should ask for.
   id++;
   targets.add(
     SphereTargetSpec(
@@ -227,6 +258,8 @@ List<SphereTargetSpec> buildSphereTargets() {
   addRing(upperYaws, kSphereRingPitchDeg, 'Upper Ring');
   addRing(lowerYaws, -kSphereRingPitchDeg, 'Lower Ring');
 
+  // Yaw is undefined at the poles and stays 0, so the recorded value is stable
+  // rather than NaN.
   id++;
   targets.add(
     SphereTargetSpec(
@@ -238,4 +271,108 @@ List<SphereTargetSpec> buildSphereTargets() {
     ),
   );
   return List<SphereTargetSpec>.unmodifiable(targets);
+}
+
+/// The sphere's reference frame for a start pose, with the phone's pitch and
+/// roll removed but its heading kept.
+///
+/// ## Why this exists
+///
+/// The layout says the middle ring is the **horizon** (pitch 0°) and the other
+/// rings are 45° above and below it. That is only true if the frame the ring is
+/// measured in has the world's up axis as its own up axis. Seeding the sphere
+/// from the first raw sensor sample does not: the phone is normally held tilted
+/// while the user reaches for **Start**, so the whole sphere inherits that tilt
+/// — every marker then sits at the same constant angle off the real room, while
+/// still tracking the phone perfectly. That is the "each target is not stuck on
+/// the correct way" symptom.
+///
+/// ## The frame trap this function used to fall into
+///
+/// Levelling used to be written as `h = (forward.x, 0, forward.z)` — a hard
+/// coded `+Y`-up assumption — and then `Quat.fromYawPitch(-heading, 0)`, a
+/// rotation about `+Y`. Android's `TYPE_ROTATION_VECTOR` reports in an
+/// **East–North–Up** frame, where up is `+Z` and `+Y` is magnetic north. So the
+/// "horizontal projection" was really a projection onto the East–Up plane, and
+/// the "yaw" was a rotation about the north axis — a *roll*. Measured on a
+/// phone held 30° down and facing north, target 1 landed on `(0, 0, −1)`,
+/// i.e. pointing at the floor, 60° away from the reticle instead of the correct
+/// 30° above it. Every ring inherited that 90° error, which is exactly what
+/// "targets scattered and tilted relative to the room" describes.
+///
+/// ## What it does now
+///
+/// It builds the levelled device→world rotation directly from an orthonormal
+/// basis, using the up axis it is *told* about:
+///
+/// * `heading` = the camera axis with its [worldUp] component removed;
+/// * `right   = heading × up`, so `right × up == −heading` and the basis is a
+///   proper rotation (determinant `+1`, never a mirror);
+/// * the frame is `[right | up | −heading]`, i.e. device `+X` → right, `+Y` →
+///   up, `−Z` (the optical axis) → heading.
+///
+/// The heading is preserved, so target 1 is still the direction the user was
+/// facing when they pressed Start — but at true horizontal level.
+///
+/// ## Rejection
+///
+/// Aiming at the ceiling or the floor leaves no stable heading — the horizontal
+/// projection collapses and any yaw taken from it would be noise. Below
+/// [minHorizontal] this returns **null**, and the caller keeps waiting for a
+/// usable pose rather than freezing a reference the whole station would inherit.
+///
+/// Pure, so the convention is testable without a sensor.
+Quat? levelStartFrame(
+  Quat deviceToWorld, {
+  Vec3 worldUp = Vec3.unitY,
+  double minHorizontal = 0.25,
+}) {
+  final up = worldUp.normalized;
+  if (up.length < 0.5) return null;
+  final forward = deviceToWorld.rotate(const Vec3(0, 0, -1));
+  // Component of the optical axis perpendicular to gravity: the heading.
+  final horizontal = forward - up * forward.dot(up);
+  if (horizontal.length < minHorizontal) return null;
+  final heading = horizontal.normalized;
+  // `right × up == −heading`, which is the image of device `+Z`; that is what
+  // makes the three columns a rotation rather than a reflection.
+  final right = heading.cross(up);
+  final back = -heading;
+  return Quat.fromMatrix3(<double>[
+    right.x, up.x, back.x, //
+    right.y, up.y, back.y, //
+    right.z, up.z, back.z, //
+  ]);
+}
+
+/// Whether [deviceToWorld] points far enough from vertical to define a heading.
+///
+/// The optical axis projected onto the plane perpendicular to [worldUp] must be
+/// at least [minHorizontal] long, i.e. the camera must be more than ~14.5° away
+/// from straight up or straight down. Below that the heading is undefined and
+/// the calibration is rejected instead of being guessed.
+bool hasStableHeading(
+  Quat deviceToWorld, {
+  Vec3 worldUp = Vec3.unitY,
+  double minHorizontal = 0.25,
+}) {
+  final up = worldUp.normalized;
+  if (up.length < 0.5) return false;
+  final forward = deviceToWorld.rotate(const Vec3(0, 0, -1));
+  return (forward - up * forward.dot(up)).length >= minHorizontal;
+}
+
+/// How far the camera axis is above the horizon, in degrees.
+///
+/// Positive is tilted **up**. Used for the "tilt up to reach the horizon" hint
+/// at Start and for the vertical half of the turn guidance; it is not part of
+/// any capture decision, which stays a true 3-D angle.
+double cameraElevationDeg(
+  Quat deviceToWorld, {
+  Vec3 worldUp = Vec3.unitY,
+}) {
+  final up = worldUp.normalized;
+  if (up.length < 0.5) return 0;
+  final forward = deviceToWorld.rotate(const Vec3(0, 0, -1));
+  return math.asin(clampDouble(forward.dot(up), -1, 1)) * radToDeg;
 }

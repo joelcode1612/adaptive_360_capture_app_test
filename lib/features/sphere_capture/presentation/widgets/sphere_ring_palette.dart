@@ -8,11 +8,17 @@ import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_t
 /// top-right progress map), not by the camera overlay: there, green means
 /// "captured" and white means "pending", and recolouring by ring would make
 /// those two states ambiguous.
-const Color kSphereZenithColor = Color(0xFFF2B233);
-const Color kSphereUpperColor = Color(0xFF6FB3E0);
+///
+/// The five rings must be **distinguishable from each other**, which the
+/// previous palette failed at: the upper and lower rings were both
+/// `#6FB3E0`, so the progress map could not show that the upper ring was
+/// finished and the lower ring was next. The hues below follow the reference
+/// legend — blue horizon, green above, orange below, purple ceiling, red floor.
+const Color kSphereZenithColor = Color(0xFF8B5CF6);
+const Color kSphereUpperColor = Color(0xFF3FA97A);
 const Color kSphereMiddleColor = Color(0xFF1F6FB2);
-const Color kSphereLowerColor = Color(0xFF6FB3E0);
-const Color kSphereNadirColor = Color(0xFFF2B233);
+const Color kSphereLowerColor = Color(0xFFE08A2E);
+const Color kSphereNadirColor = Color(0xFFDC4C4C);
 
 /// The reference diagram's colour for [spec]'s ring.
 Color sphereRingColor(SphereTargetSpec spec) {

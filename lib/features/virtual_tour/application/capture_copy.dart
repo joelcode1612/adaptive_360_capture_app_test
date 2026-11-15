@@ -148,11 +148,24 @@ String guidanceBanner(CaptureGuidanceState state, {bool moving = false}) {
 /// The turn/look instruction during `search`, ported from the prototype's
 /// `dirT`. [dyDeg] is the signed yaw error (positive = turn right) and [dpDeg]
 /// the pitch error (positive = look up); the yaw error is zeroed for poles.
-String searchDirection(double dyDeg, double dpDeg) => dyDeg.abs() >= dpDeg.abs()
-    ? (dyDeg > 0 ? 'Turn right' : 'Turn left')
-    : dpDeg > 0
-    ? (dpDeg > 25 ? 'Look up' : 'Look slightly up')
-    : (dpDeg < -25 ? 'Look down' : 'Look slightly down');
+///
+/// The prototype names one axis. When both are large the phone has to move
+/// diagonally, and "Turn right" alone sends the user past the target — so a
+/// genuine two-axis correction is said as one instruction, "Turn right and tilt
+/// down". The single-axis strings are unchanged, which keeps every case the
+/// prototype covers word-for-word.
+String searchDirection(double dyDeg, double dpDeg) {
+  final yaw = dyDeg.abs();
+  final pitch = dpDeg.abs();
+  if (yaw >= 2 && pitch >= 2 && pitch >= yaw * 0.4) {
+    return 'Turn ${dyDeg > 0 ? 'right' : 'left'} and tilt '
+        '${dpDeg > 0 ? 'up' : 'down'}';
+  }
+  if (yaw >= pitch) return dyDeg > 0 ? 'Turn right' : 'Turn left';
+  return dpDeg > 0
+      ? (dpDeg > 25 ? 'Look up' : 'Look slightly up')
+      : (dpDeg < -25 ? 'Look down' : 'Look slightly down');
+}
 
 // ── Naming the part of the room that is missing ──────────────────────────
 

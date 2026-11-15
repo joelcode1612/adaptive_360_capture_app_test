@@ -24,6 +24,23 @@ const String arTargetAssetPath = 'assets/models/ar_capture_target.glb';
 /// Asset path of the white frame bezel around the target.
 const String arBezelAssetPath = 'assets/models/white_frame_bezel.glb';
 
+/// How much larger the target is **drawn** than its specified size.
+///
+/// The plate is authored at 0.22 m across and planted 1.0 m down the aim ray, so
+/// on a phone it covers roughly a quarter of the viewfinder width — small enough
+/// that the earlier device runs described it as hard to find. 1.35 is the low
+/// end of the brief's 30–50 % band and is applied **only at render time**:
+///
+/// * the anchor and the model matrix are untouched, so the marker stays exactly
+///   on its computed world position;
+/// * the alignment tolerance, the angular error and the capture trigger are
+///   angular and never read this value;
+/// * the plate and its bezel scale together, so they stay coplanar.
+///
+/// Anything that needs the marker's *specified* size must use
+/// `CaptureGeometryConfig.targetDiameterM`, not this constant.
+const double kArTargetDisplayScale = 1.35;
+
 /// Native dimensions of [arTargetAssetPath], in metres, from its glTF accessor
 /// bounds — **verified against the asset's own vertices, not assumed**:
 ///

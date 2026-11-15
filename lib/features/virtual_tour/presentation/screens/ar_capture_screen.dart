@@ -281,7 +281,8 @@ class _ArCaptureScreenState extends State<ArCaptureScreen> {
               '${engine.stations[engine.currentStation].total}',
               style: const TextStyle(
                 color: CaptureColors.headerMuted,
-                fontSize: 12,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
               ),
             ),
             // The header's `‹` is the prototype's `back()`, which lands on the
@@ -598,27 +599,38 @@ class _MiniMap extends StatelessWidget {
   Widget build(BuildContext context) {
     final record = engine.stations[engine.currentStation];
     final session = engine.session;
-    return SizedBox.square(
-      dimension: CaptureMetrics.miniMapSize,
-      child: FilledButton(
-        style: FilledButton.styleFrom(
-          backgroundColor: CaptureColors.cameraChrome.withValues(alpha: 0.72),
-          padding: const EdgeInsets.all(5),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(CaptureMetrics.miniMapRadius),
+    final done = record.capturedCount;
+    final total = record.total;
+    return Semantics(
+      button: true,
+      label:
+          'Capture progress: $done of $total photographs saved. '
+          'Open the progress map',
+      child: SizedBox.square(
+        dimension: CaptureMetrics.miniMapSize,
+        child: FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: CaptureColors.cameraChrome.withValues(alpha: 0.82),
+            padding: const EdgeInsets.all(5),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(CaptureMetrics.miniMapRadius),
+              side: const BorderSide(color: CaptureColors.hairlineChip),
+            ),
           ),
-        ),
-        onPressed: () => controller.goTo(CaptureScreen.progressMap),
-        child: SphereProgressMap(
-          frames: record.plan.frames,
-          statuses: record.statuses,
-          currentIndex: session == null || session.targets.isEmpty
-              ? null
-              : session.currentTargetIndex,
-          size: CaptureMetrics.miniMapSize - 10,
-          // The prototype's miniature draws the target cloud faintly and the
-          // plan dots on top; at 78 dp the cloud is noise, so it stays off.
-          showSamples: false,
+          onPressed: () => controller.goTo(CaptureScreen.progressMap),
+          child: ExcludeSemantics(
+            child: SphereProgressMap(
+              frames: record.plan.frames,
+              statuses: record.statuses,
+              currentIndex: session == null || session.targets.isEmpty
+                  ? null
+                  : session.currentTargetIndex,
+              size: CaptureMetrics.miniMapSize - 10,
+              // The prototype's miniature draws the target cloud faintly and the
+              // plan dots on top; at 78 dp the cloud is noise, so it stays off.
+              showSamples: false,
+            ),
+          ),
         ),
       ),
     );
@@ -844,25 +856,57 @@ class _Banner extends StatelessWidget {
   final bool bordered;
 
   @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-    decoration: BoxDecoration(
-      color: CaptureColors.cameraChrome.withValues(alpha: 0.8),
-      border: bordered ? Border.all(color: color) : null,
-      borderRadius: BorderRadius.circular(10),
-    ),
-    child: Text(
-      text,
-      style: const TextStyle(color: Colors.white, fontSize: 12, height: 1.35),
+  Widget build(BuildContext context) => Semantics(
+    liveRegion: true,
+    label: text,
+    child: ExcludeSemantics(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: CaptureColors.cameraChrome.withValues(alpha: 0.88),
+          border: bordered ? Border.all(color: color, width: 1.4) : null,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(
+              bordered ? Icons.warning_amber_rounded : Icons.autorenew,
+              size: 16,
+              color: color,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                text,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  height: 1.35,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     ),
   );
 }
 
-/// The prototype's `.ip` — the instruction panel under the viewfinder.
+/// The instruction footer under the viewfinder.
 ///
-/// It is a fixed 128 dp so the viewfinder never resizes when the guidance text
-/// changes length, which is the reference's behaviour and the reason the guidance
-/// headline is 22 px rather than the 17 px the first port used.
+/// The reference's AR page is a dark camera stage with a **white** footer
+/// (`.native-footer{background:white}`): one headline, one line of detail, the
+/// hold progress, and only the action the current state actually offers. The
+/// previous port kept the whole chrome dark, which is why this screen did not
+/// read as SiteWise.
+///
+/// **What never hides, and why.** The block reason stays on screen in every
+/// state. A footer that hides *why* the shutter is waiting would be a progress
+/// bar with no explanation. The technical readout (`yaw −12° · pitch +4° ·
+/// error 3.2°`) moved into the collapsible detail instead of the headline: it is
+/// a diagnostic, not an instruction.
 class _InstructionPanel extends StatelessWidget {
   const _InstructionPanel({required this.engine, required this.controller});
 
@@ -904,81 +948,197 @@ class _InstructionPanel extends StatelessWidget {
       outOfView: g.outOfView,
     );
 
-    return Container(
-      width: double.infinity,
-      height: CaptureMetrics.instructionHeight,
-      color: CaptureColors.cameraChrome,
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 22,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          Text(
-            sub,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: CaptureColors.mutedOnDark,
-              fontSize: 13,
-              height: 1.35,
-            ),
-          ),
-          const Spacer(),
-          Row(
+    final hold = g.state == CaptureGuidanceState.cap ? g.capProgress : 0.0;
+    final tone = _footerTone(g.state);
+    final failed = g.state == CaptureGuidanceState.fail;
+
+    return Material(
+      color: SiteWiseColors.surface,
+      borderRadius: const BorderRadius.vertical(
+        top: Radius.circular(CaptureMetrics.footerRadius),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Expanded(
-                child: Text(
-                  progressLine(
-                    captured: record.capturedCount,
-                    total: record.total,
-                    skipped: record.skippedCount,
+              Row(
+                children: [
+                  _FooterPill(label: tone.label, color: tone.color),
+                  const Spacer(),
+                  Text(
+                    progressLine(
+                      captured: record.capturedCount,
+                      total: record.total,
+                      skipped: record.skippedCount,
+                    ),
+                    style: const TextStyle(
+                      color: SiteWiseColors.muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
-                  style: const TextStyle(
-                    color: CaptureColors.mutedOnDark,
-                    fontSize: 12,
+                ],
+              ),
+              const SizedBox(height: 10),
+              // The one instruction. A live region so a screen reader announces
+              // the transitions ("Target aligned — hold still") and nothing
+              // else; the camera frame itself is never announced.
+              Semantics(
+                liveRegion: true,
+                label: '$title. $sub',
+                child: ExcludeSemantics(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: SiteWiseColors.ink,
+                          fontSize: 20,
+                          height: 1.2,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        sub,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: SiteWiseColors.muted,
+                          fontSize: 13,
+                          height: 1.35,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-              // `.ip .r button` is a small amber chip, not a text link — the
-              // one action in this panel has to look pressable over a dark
-              // panel. Its label is dark-on-amber rather than the reference's
-              // white-on-amber, which measures 2.1:1 and fails WCAG AA.
-              if (g.state == CaptureGuidanceState.fail)
-                _PanelButton(
-                  label: 'Retry',
-                  onPressed: () {
-                    engine.retryFailed();
-                    controller.refresh();
-                  },
-                )
-              else if (engine.manualCaptureOffered)
-                _PanelButton(
-                  label: 'Capture anyway',
-                  onPressed: () {
-                    engine.manualCapture();
-                    controller.refresh();
-                  },
+              const SizedBox(height: 12),
+              // Hold / capture progress. Always present so the bar does not
+              // appear from nowhere when alignment starts; empty until the hold
+              // is actually accumulating.
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: hold.clamp(0.0, 1.0),
+                  minHeight: 7,
+                  backgroundColor: CaptureColors.trackOnLight,
+                  valueColor: AlwaysStoppedAnimation<Color>(tone.color),
                 ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Expanded(
+                    child: Text(
+                      failed
+                          ? 'This view is not marked as done. Retry when the '
+                                'marker is back in the circle.'
+                          : hold > 0
+                          ? 'Taking photo…'
+                          : 'Hold the marker inside the circle.',
+                      maxLines: 2,
+                      style: TextStyle(
+                        color: failed
+                            ? CaptureColors.warnOnLight
+                            : SiteWiseColors.muted,
+                        fontSize: 12,
+                        height: 1.3,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  if (failed || engine.manualCaptureOffered) ...[
+                    const SizedBox(width: 12),
+                    _FooterAction(
+                      label: failed ? 'Retry' : 'Capture anyway',
+                      onPressed: () {
+                        if (failed) {
+                          engine.retryFailed();
+                        } else {
+                          engine.manualCapture();
+                        }
+                        controller.refresh();
+                      },
+                    ),
+                  ],
+                ],
+              ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
 }
 
-/// `.ip .r button` — the amber action chip in the instruction panel's footer.
-class _PanelButton extends StatelessWidget {
-  const _PanelButton({required this.label, required this.onPressed});
+/// The footer's state pill: what the capture engine is doing, in words.
+({String label, Color color}) _footerTone(CaptureGuidanceState state) =>
+    switch (state) {
+      CaptureGuidanceState.init => (
+        label: 'Starting camera',
+        color: SiteWiseColors.muted,
+      ),
+      CaptureGuidanceState.search => (
+        label: 'Find the target',
+        color: CaptureColors.primary,
+      ),
+      CaptureGuidanceState.align => (
+        label: 'Aligned',
+        color: CaptureColors.okOnLight,
+      ),
+      CaptureGuidanceState.cap => (
+        label: 'Taking photo',
+        color: CaptureColors.okOnLight,
+      ),
+      CaptureGuidanceState.done => (
+        label: 'Photo saved',
+        color: CaptureColors.okOnLight,
+      ),
+      CaptureGuidanceState.fail => (
+        label: 'Capture failed',
+        color: CaptureColors.warnOnLight,
+      ),
+    };
+
+/// A soft-tinted pill on the white footer — `.pill` in the reference.
+class _FooterPill extends StatelessWidget {
+  const _FooterPill({required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+    decoration: BoxDecoration(
+      color: color.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(100),
+      border: Border.all(color: color.withValues(alpha: 0.35)),
+    ),
+    child: Text(
+      label,
+      style: TextStyle(
+        color: color,
+        fontSize: 12,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.2,
+      ),
+    ),
+  );
+}
+
+/// The one action the footer offers, as the reference's `.btn`.
+class _FooterAction extends StatelessWidget {
+  const _FooterAction({required this.label, required this.onPressed});
 
   final String label;
   final VoidCallback onPressed;
@@ -987,15 +1147,13 @@ class _PanelButton extends StatelessWidget {
   Widget build(BuildContext context) => FilledButton(
     onPressed: onPressed,
     style: FilledButton.styleFrom(
-      backgroundColor: CaptureColors.warn,
-      foregroundColor: CaptureColors.cameraChrome,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-      minimumSize: Size.zero,
-      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-      ),
-      textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+      backgroundColor: CaptureColors.primary,
+      foregroundColor: Colors.white,
+      overlayColor: CaptureColors.primaryPressed,
+      minimumSize: const Size(96, CaptureMetrics.minTouchTarget),
+      padding: const EdgeInsets.symmetric(horizontal: 18),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
     ),
     child: Text(label),
   );
@@ -1110,23 +1268,29 @@ class ProgressMapScreen extends StatelessWidget {
         .length;
 
     return FlowScaffold(
+      // Progress is one of the reference's white screens: a map, a count and a
+      // ring breakdown, read at a glance rather than aimed with.
+      onLight: true,
       title: 'Capture ${record.capturedCount} of ${record.total}',
       onBack: () => controller.goTo(CaptureScreen.arCapture),
       body: Column(
         children: [
+          const SizedBox(height: 6),
           Center(
             child: SphereProgressMap(
               frames: record.plan.frames,
               statuses: record.statuses,
               currentIndex: current,
               size: 260,
+              onLight: true,
             ),
           ),
           const SizedBox(height: 12),
           Text(
             '${record.capturedCount} completed · '
             '${current == null ? 'no target' : 'now on view ${current + 1}'}',
-            style: const TextStyle(color: CaptureColors.mutedOnDark),
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: SiteWiseColors.muted, fontSize: 13),
           ),
           const SizedBox(height: 18),
           for (final ring in progressRings)
@@ -1134,19 +1298,46 @@ class ProgressMapScreen extends StatelessWidget {
               label: ring.label,
               done: ringDone(ring.fromPitchDeg, ring.toPitchDeg),
               total: ringTotal(ring.fromPitchDeg, ring.toPitchDeg),
+              color: CaptureColors.okOnLight,
+              onLight: true,
             ),
           RingProgressRow(
             label: 'Zenith / Nadir',
             done: polesDone,
             total: poles.length,
+            color: CaptureColors.okOnLight,
+            onLight: true,
           ),
           const SizedBox(height: 14),
-          const NoteCard(
-            icon: Icons.info_outline,
-            child: Text(
-              'This map shows capture progress. It is not the AR target in the '
-              'camera view — the ring breakdown is by pitch band, not by the '
-              'order you capture in.',
+          Container(
+            padding: const EdgeInsets.all(13),
+            decoration: BoxDecoration(
+              color: SiteWiseColors.softBlue,
+              borderRadius: BorderRadius.circular(13),
+              border: Border.all(color: SiteWiseColors.borderStrong),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.info_outline,
+                  size: 18,
+                  color: SiteWiseColors.primary,
+                ),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'This map shows capture progress. It is not the AR target in '
+                    'the camera view — the ring breakdown is by pitch band, not '
+                    'by the order you capture in.',
+                    style: TextStyle(
+                      color: Color(0xFF1E3A8A),
+                      fontSize: 12,
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ],

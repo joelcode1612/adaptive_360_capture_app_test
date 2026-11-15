@@ -72,9 +72,11 @@ class FrameGallery extends StatelessWidget {
             ),
             Text(
               '$stored of ${frames.length} on disk',
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 12,
-                color: CaptureColors.mutedOnDark,
+                color: Theme.of(context).brightness == Brightness.light
+                    ? SiteWiseColors.muted
+                    : CaptureColors.mutedOnDark,
               ),
             ),
           ],
@@ -114,16 +116,20 @@ class _FrameTile extends StatelessWidget {
   final GalleryFrame frame;
   final VoidCallback? onTap;
 
-  Color get _ring => switch (frame.status) {
+  Color _ring(bool light) => switch (frame.status) {
     TargetStatus.ok =>
-      frame.needsRetake ? CaptureColors.warn : CaptureColors.ok,
-    TargetStatus.skipped => CaptureColors.warn,
+      frame.needsRetake
+          ? (light ? CaptureColors.warnOnLight : CaptureColors.warn)
+          : (light ? CaptureColors.okOnLight : CaptureColors.ok),
+    TargetStatus.skipped =>
+      light ? CaptureColors.warnOnLight : CaptureColors.warn,
     TargetStatus.pending => Colors.transparent,
   };
 
   @override
   Widget build(BuildContext context) {
     final path = frame.imagePath;
+    final light = Theme.of(context).brightness == Brightness.light;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
@@ -132,22 +138,24 @@ class _FrameTile extends StatelessWidget {
           borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
           border: Border.all(
             color: frame.status == TargetStatus.pending
-                ? CaptureColors.hairlineOnDark
-                : _ring,
+                ? (light ? SiteWiseColors.border : CaptureColors.hairlineOnDark)
+                : _ring(light),
             width: 2,
           ),
-          color: CaptureColors.cardOnDark,
+          color: light ? SiteWiseColors.paper : CaptureColors.cardOnDark,
         ),
         clipBehavior: Clip.antiAlias,
         child: Stack(
           fit: StackFit.expand,
           children: [
             if (path == null)
-              const Center(
+              Center(
                 child: Icon(
                   Icons.photo_camera_outlined,
                   size: 20,
-                  color: CaptureColors.mutedOnDark,
+                  color: light
+                      ? CaptureColors.pendingDotOnLight
+                      : CaptureColors.mutedOnDark,
                 ),
               )
             else

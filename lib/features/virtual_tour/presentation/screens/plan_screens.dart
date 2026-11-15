@@ -26,6 +26,7 @@ class IntroScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => FlowScaffold(
+    onLight: true,
     body: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -39,6 +40,9 @@ class IntroScreen extends StatelessWidget {
               frames: plan26().frames,
               statuses: const <TargetStatus>[],
               size: 200,
+              // The intro is one of the reference's white screens: the map's
+              // white-alpha disc would vanish on it.
+              onLight: true,
             ),
           ),
         ),
@@ -52,7 +56,7 @@ class IntroScreen extends StatelessWidget {
           'Capture your commercial space from guided directions to create a '
           '360° virtual tour. Each station is a set of views around one point, '
           'planned from your camera\'s field of view so the views overlap.',
-          style: TextStyle(color: CaptureColors.mutedOnDark, height: 1.45),
+          style: TextStyle(color: SiteWiseColors.muted, height: 1.45),
         ),
         const SizedBox(height: 12),
         const _Step(n: '1', text: 'Describe your room.'),
@@ -165,8 +169,9 @@ class _Step extends StatelessWidget {
     child: Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: CaptureColors.cardOnDark,
+        color: SiteWiseColors.surface,
         borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: SiteWiseColors.border),
       ),
       child: Row(
         children: [
@@ -206,6 +211,7 @@ class RoomDetailsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => FlowScaffold(
+    onLight: true,
     title: 'Room details',
     onBack: controller.back,
     body: Column(
@@ -297,7 +303,7 @@ class _RoomCard extends StatelessWidget {
     // `.cd` / `.on`: 1.5 px translucent-white rule over a 5 % white fill, and the
     // selected card swaps both for the green the reference uses — `#4cc27f`, not
     // the `#2f9e5b` the buttons use.
-    final rule = selected ? CaptureColors.ok : CaptureColors.hairlineOnDark;
+    final rule = selected ? CaptureColors.primary : SiteWiseColors.border;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(12),
@@ -306,9 +312,7 @@ class _RoomCard extends StatelessWidget {
         decoration: BoxDecoration(
           border: Border.all(color: rule, width: 1.5),
           borderRadius: BorderRadius.circular(12),
-          color: selected
-              ? CaptureColors.selectedFill
-              : CaptureColors.groupOnDark,
+          color: selected ? SiteWiseColors.softBlue : SiteWiseColors.paper,
         ),
         child: Column(
           children: [
@@ -363,7 +367,7 @@ class _OptionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // `.op` / `.on` — the same rule and fill as `.cd`, at full width.
-    final rule = selected ? CaptureColors.ok : CaptureColors.hairlineOnDark;
+    final rule = selected ? CaptureColors.primary : SiteWiseColors.border;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(12),
@@ -373,15 +377,17 @@ class _OptionCard extends StatelessWidget {
         decoration: BoxDecoration(
           border: Border.all(color: rule, width: 1.5),
           borderRadius: BorderRadius.circular(12),
-          color: selected
-              ? CaptureColors.selectedFill
-              : CaptureColors.groupOnDark,
+          color: selected ? SiteWiseColors.softBlue : SiteWiseColors.paper,
         ),
         child: Row(
           children: [
             Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
             if (selected)
-              const Icon(Icons.check_circle, color: CaptureColors.ok, size: 20),
+              const Icon(
+                Icons.check_circle,
+                color: CaptureColors.okOnLight,
+                size: 20,
+              ),
           ],
         ),
       ),
@@ -401,6 +407,7 @@ class PlanScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final rec = engine.recommendation;
     return FlowScaffold(
+      onLight: true,
       title: 'Capture plan',
       onBack: controller.back,
       body: Column(
@@ -419,10 +426,7 @@ class PlanScreen extends StatelessWidget {
           const SizedBox(height: 6),
           Text(
             rec.body,
-            style: const TextStyle(
-              color: CaptureColors.mutedOnDark,
-              height: 1.45,
-            ),
+            style: const TextStyle(color: SiteWiseColors.muted, height: 1.45),
           ),
           const SizedBox(height: 10),
           Row(
@@ -444,6 +448,8 @@ class PlanScreen extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 14),
+          const _CaptureGuideCard(),
           const SizedBox(height: 10),
           NoteCard(
             icon: Icons.help_outline,
@@ -521,7 +527,7 @@ class _PlanOption extends StatelessWidget {
   Widget build(BuildContext context) {
     // `.cmp>div` — the unselected card is the same surface at 65 % opacity,
     // which is how the reference marks the plan it did not recommend.
-    final rule = selected ? CaptureColors.ok : CaptureColors.hairlineOnDark;
+    final rule = selected ? CaptureColors.primary : SiteWiseColors.border;
     return Opacity(
       opacity: selected ? 1 : 0.65,
       child: Container(
@@ -530,9 +536,7 @@ class _PlanOption extends StatelessWidget {
         decoration: BoxDecoration(
           border: Border.all(color: rule, width: 1.5),
           borderRadius: BorderRadius.circular(12),
-          color: selected
-              ? CaptureColors.selectedFill
-              : CaptureColors.groupOnDark,
+          color: selected ? SiteWiseColors.softBlue : SiteWiseColors.paper,
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -548,14 +552,18 @@ class _PlanOption extends StatelessWidget {
                     Icon(
                       Icons.person_pin_circle,
                       size: 20,
-                      color: selected ? CaptureColors.ok : rule,
+                      color: selected ? CaptureColors.primary : rule,
                     ),
                 ],
               ),
             ),
             Text(
               label,
-              style: const TextStyle(fontSize: 12),
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: selected ? CaptureColors.primary : SiteWiseColors.slate,
+              ),
               textAlign: TextAlign.center,
             ),
           ],
@@ -563,4 +571,123 @@ class _PlanOption extends StatelessWidget {
       ),
     );
   }
+}
+
+/// How to capture each direction, in the reference's `.guide-entry` style.
+///
+/// The plan tells the user *how many* views there are; this tells them *where
+/// to point the phone*, which is the question a first-time user actually asks.
+/// Five rows, one per band of the sphere — the same bands the progress map
+/// breaks down, so the two screens cannot describe the plan differently.
+class _CaptureGuideCard extends StatelessWidget {
+  const _CaptureGuideCard();
+
+  static const List<({IconData icon, String title, String detail})> _steps = [
+    (
+      icon: Icons.straighten,
+      title: 'Middle ring',
+      detail: 'Hold the phone level and turn a full circle.',
+    ),
+    (
+      icon: Icons.keyboard_arrow_up,
+      title: 'Upper ring',
+      detail: 'Tilt up about 45° and turn a full circle again.',
+    ),
+    (
+      icon: Icons.keyboard_arrow_down,
+      title: 'Lower ring',
+      detail: 'Tilt down about 45° and turn a full circle again.',
+    ),
+    (
+      icon: Icons.arrow_upward,
+      title: 'Ceiling',
+      detail: 'Point the phone straight up and hold still.',
+    ),
+    (
+      icon: Icons.arrow_downward,
+      title: 'Floor',
+      detail: 'Point the phone straight down and hold still.',
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.fromLTRB(14, 13, 14, 5),
+    decoration: BoxDecoration(
+      color: SiteWiseColors.surface,
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: SiteWiseColors.border),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'How to capture',
+          style: TextStyle(
+            color: SiteWiseColors.ink,
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(height: 2),
+        const Text(
+          'The phone takes each photo automatically once the marker is in the '
+          'circle. You only have to turn and hold.',
+          style: TextStyle(
+            color: SiteWiseColors.muted,
+            fontSize: 12,
+            height: 1.45,
+          ),
+        ),
+        const SizedBox(height: 10),
+        for (final step in _steps)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: SiteWiseColors.softBlue,
+                    borderRadius: BorderRadius.circular(9),
+                  ),
+                  alignment: Alignment.center,
+                  child: Icon(
+                    step.icon,
+                    size: 17,
+                    color: SiteWiseColors.primary,
+                  ),
+                ),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        step.title,
+                        style: const TextStyle(
+                          color: SiteWiseColors.ink,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      Text(
+                        step.detail,
+                        style: const TextStyle(
+                          color: SiteWiseColors.muted,
+                          fontSize: 12,
+                          height: 1.45,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    ),
+  );
 }

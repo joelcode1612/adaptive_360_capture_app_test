@@ -7,6 +7,7 @@ import 'package:adaptive_360_capture_app/features/capture/domain/services/statio
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_target_model.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/arcore_ar.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
 
@@ -160,6 +161,15 @@ class PlaneAnchorService {
   /// is the authored size — the same value the old code used permanently, and
   /// the reason the marker filled half the view.
   double markerScale = 1;
+
+  /// The scale actually handed to the renderer.
+  ///
+  /// [kArTargetDisplayScale] is a **display-only** enlargement: it multiplies
+  /// the model before projection, so the plate is easier to find on a busy wall
+  /// while its anchor, its world position and every angular calculation stay
+  /// exactly where they were. Keeping it out of [markerScale] means the
+  /// geometry-facing value still means "the specified 0.22 m plate".
+  double get drawScale => markerScale * kArTargetDisplayScale;
 
   int get placedCount => _placementsById.length;
 
@@ -438,7 +448,7 @@ class PlaneAnchorService {
             localRotation: placement.localRotation,
             modelMatrix: modelMatrix,
             useModelTranslation: true,
-            scale: markerScale * 3.5,
+            scale: drawScale * 3.5,
             // No setback: the debug plate must not hide behind the bezel, and
             // its colour must be impossible to mistake for the real marker.
             tint: kDebugMarkerTint,
@@ -458,7 +468,7 @@ class PlaneAnchorService {
           localRotation: placement.localRotation,
           modelMatrix: modelMatrix,
           useModelTranslation: true,
-          scale: markerScale,
+          scale: drawScale,
           offset: Vec3(0, 0, -geometry.bezelSetbackM),
           tint: tint,
           useTint: true,
@@ -476,7 +486,7 @@ class PlaneAnchorService {
           localRotation: placement.localRotation,
           modelMatrix: modelMatrix,
           useModelTranslation: true,
-          scale: markerScale,
+          scale: drawScale,
           tint: markerTint ?? kBezelIdleTint,
           useTint: markerTint != null,
           opacity: targetOpacity,

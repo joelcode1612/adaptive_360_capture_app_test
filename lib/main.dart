@@ -5,11 +5,11 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capt
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/screens/virtual_tour_camera_screen.dart';
 
-/// 360° Virtual Tour — the capture app.
+/// SiteWise 360° Capture — the capture app.
 ///
 /// Portrait only. The capture plan is defined by yaw and pitch around a standing
-/// person, the 26-point grid assumes the phone's long side is vertical, and the
-/// prototype is a phone-shaped column — so rotating the activity would change
+/// person, the target grid assumes the phone's long side is vertical, and the
+/// reference is a phone-shaped column — so rotating the activity would change
 /// what the guidance means, not merely how it looks. The lock is applied here
 /// rather than in the manifest so the same Dart entry behaves identically under
 /// `flutter test`.
@@ -34,11 +34,13 @@ class VirtualTourApp extends StatelessWidget {
       // use, and the two agreeing is the only reason either is trustworthy.
       title: 'SiteWise 360° Capture',
       debugShowCheckedModeBanner: false,
-      // One theme for the whole app. The prototype keeps every screen —
-      // settings and review included — inside `.phone{background:#0f1418}`, so
-      // there is no light variant to follow the system into and no `darkTheme`
-      // to switch on.
-      theme: captureAppTheme(),
+      // Two themes, each with one job. [captureLightTheme] is the SiteWise
+      // white surface the launcher and the light screens use; the camera
+      // screens opt into [captureAppTheme] themselves, because a viewfinder
+      // cannot be shown on white. `themeMode` is pinned rather than left to the
+      // system: a phone in dark mode must not turn the white screens dark.
+      theme: captureLightTheme(),
+      themeMode: ThemeMode.light,
       home: const CaptureLauncher(),
     );
   }
@@ -48,11 +50,10 @@ class VirtualTourApp extends StatelessWidget {
 ///
 /// Three, and the difference is stated rather than hidden:
 ///
-/// * **AR 360° Capture (38 Targets)** is the 3DoF sphere-follows-phone flow.
-///   The sphere's centre is the phone, only rotation is tracked, and the 26
+/// * **AR 360° Capture (26 Targets)** is the 3DoF sphere-follows-phone flow.
+///   The sphere's centre is the phone, only rotation is tracked, and the
 ///   targets are projected from the device quaternion — no ARCore session, no
-///   planes, no anchors and no calibration. This is the SiteWise 360° Capture
-///   architecture.
+///   planes, no anchors and no calibration.
 /// * **Virtual tour** is the 30-node station: a 1.0 m world-locked sphere, the
 ///   GLB target at every node, an automatic shutter, then upload and stitching.
 ///   Android/ARCore only, and deliberately separate from the 3DoF flow.
@@ -63,74 +64,103 @@ class CaptureLauncher extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    backgroundColor: CaptureColors.cameraChrome,
+    backgroundColor: SiteWiseColors.paper,
     body: SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const SizedBox(height: 12),
-            const Text(
-              '360° Virtual Tour',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 24,
-                fontWeight: FontWeight.w700,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
+        children: [
+          const _Brand(),
+          const SizedBox(height: 26),
+          _LaunchCard(
+            title: 'AR 360° Capture (26 Targets)',
+            subtitle:
+                'Sphere-follows-phone capture with an automatic shutter and an '
+                'on-device 360° panorama. No ARCore, no calibration, no drift.',
+            icon: Icons.threesixty,
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const SphereCaptureScreen(),
               ),
             ),
-            const SizedBox(height: 6),
-            const Text(
-              'Capture a commercial space one station at a time.',
-              style: TextStyle(color: CaptureColors.mutedOnDark),
-            ),
-            const SizedBox(height: 28),
-            _LaunchCard(
-              title: 'AR 360° Capture (38 Targets)',
-              subtitle:
-                  '3DoF sphere-follows-phone capture: 38 targets, automatic '
-                  'shutter and an on-device 360° panorama. No ARCore, no '
-                  'calibration, no drift.',
-              icon: Icons.threesixty,
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => const SphereCaptureScreen(),
-                ),
+          ),
+          const SizedBox(height: 12),
+          _LaunchCard(
+            title: 'Virtual tour · 30 nodes',
+            subtitle:
+                'World-locked ARCore markers with automatic capture, then '
+                'upload and stitching. Android with ARCore only.',
+            icon: Icons.explore_outlined,
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const VirtualTourCameraScreen(),
               ),
             ),
-            const SizedBox(height: 12),
-            _LaunchCard(
-              title: 'Virtual tour · 30 nodes',
-              subtitle:
-                  'A 1.0 m sphere of world-locked markers with automatic '
-                  'capture, then upload and stitching. Android with ARCore only.',
-              icon: Icons.explore_outlined,
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => const VirtualTourCameraScreen(),
-                ),
+          ),
+          const SizedBox(height: 12),
+          _LaunchCard(
+            title: 'Guided flow',
+            subtitle:
+                'Room details, capture plan, 26 guided views and the review '
+                'screens. Runs without AR.',
+            icon: Icons.photo_camera_outlined,
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const CaptureFlowScreen(),
               ),
             ),
-            const SizedBox(height: 12),
-            _LaunchCard(
-              title: 'Guided flow',
-              subtitle:
-                  'The sensor-guided prototype port: room details, plan, '
-                  'station review and tour preview. Runs without AR.',
-              icon: Icons.photo_camera_outlined,
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => const CaptureFlowScreen(),
-                ),
-              ),
-            ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 22),
+          const _ShellNote(),
+        ],
       ),
     ),
   );
 }
 
+/// The reference's `.brand`: a blue mark, a product name and a one-line role.
+class _Brand extends StatelessWidget {
+  const _Brand();
+
+  @override
+  Widget build(BuildContext context) => Row(
+    children: [
+      Container(
+        width: 46,
+        height: 46,
+        decoration: BoxDecoration(
+          color: SiteWiseColors.primary,
+          borderRadius: BorderRadius.circular(13),
+        ),
+        alignment: Alignment.center,
+        child: const Icon(Icons.threesixty, color: Colors.white, size: 26),
+      ),
+      const SizedBox(width: 12),
+      const Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'SiteWise 360° Capture',
+              style: TextStyle(
+                color: SiteWiseColors.ink,
+                fontSize: 19,
+                fontWeight: FontWeight.w800,
+                letterSpacing: -0.4,
+              ),
+            ),
+            SizedBox(height: 2),
+            Text(
+              'Capture a commercial space one station at a time',
+              style: TextStyle(color: SiteWiseColors.muted, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
+}
+
+/// The reference's `.info-panel` with a `.tab`-style action row.
 class _LaunchCard extends StatelessWidget {
   const _LaunchCard({
     required this.title,
@@ -145,20 +175,32 @@ class _LaunchCard extends StatelessWidget {
   final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context) => Card(
-    color: CaptureColors.sheet,
-    shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.circular(CaptureMetrics.cornerRadius),
-    ),
+  Widget build(BuildContext context) => Material(
+    color: SiteWiseColors.surface,
+    borderRadius: BorderRadius.circular(16),
     child: InkWell(
-      borderRadius: BorderRadius.circular(CaptureMetrics.cornerRadius),
+      borderRadius: BorderRadius.circular(16),
       onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
+      child: Container(
+        padding: const EdgeInsets.all(15),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: SiteWiseColors.border),
+        ),
         child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(icon, color: CaptureColors.accent, size: 30),
-            const SizedBox(width: 14),
+            Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                color: SiteWiseColors.softBlue,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              alignment: Alignment.center,
+              child: Icon(icon, color: SiteWiseColors.primary, size: 22),
+            ),
+            const SizedBox(width: 13),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -166,27 +208,55 @@ class _LaunchCard extends StatelessWidget {
                   Text(
                     title,
                     style: const TextStyle(
-                      color: Colors.white,
+                      color: SiteWiseColors.ink,
                       fontSize: 16,
-                      fontWeight: FontWeight.w600,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     subtitle,
                     style: const TextStyle(
-                      color: CaptureColors.mutedOnDark,
-                      fontSize: 12,
-                      height: 1.4,
+                      color: SiteWiseColors.muted,
+                      fontSize: 13,
+                      height: 1.45,
                     ),
                   ),
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, color: CaptureColors.mutedOnDark),
+            const Padding(
+              padding: EdgeInsets.only(top: 10),
+              child: Icon(
+                Icons.chevron_right,
+                color: SiteWiseColors.muted,
+                size: 20,
+              ),
+            ),
           ],
         ),
       ),
+    ),
+  );
+}
+
+/// The reference's `.callout` — what this build is and is not.
+class _ShellNote extends StatelessWidget {
+  const _ShellNote();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(13),
+    decoration: BoxDecoration(
+      color: SiteWiseColors.softBlue,
+      borderRadius: BorderRadius.circular(13),
+      border: Border.all(color: SiteWiseColors.borderStrong),
+    ),
+    child: const Text(
+      'Photographs stay on this device until you export them. ARCore is used '
+      'only by the two AR paths; the guided flow needs a camera and motion '
+      'sensors.',
+      style: TextStyle(color: Color(0xFF1E3A8A), fontSize: 12, height: 1.5),
     ),
   );
 }

@@ -320,7 +320,7 @@ void main() {
           loadRecords: () => repository.loadRecords(stationId),
           onStarted: () => started++,
           onStage: (_) {},
-          onSuccess: () => succeeded++,
+          onSuccess: (String panoramaPath) => succeeded++,
           onFailure: (_) => fail('the first completion must succeed'),
         );
 
@@ -355,7 +355,7 @@ void main() {
         },
         onStarted: () {},
         onStage: (_) {},
-        onSuccess: () => succeeded++,
+        onSuccess: (String panoramaPath) => succeeded++,
         onFailure: failures.add,
       );
 

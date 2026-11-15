@@ -105,16 +105,26 @@ class _FallbackReticlePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final centre = Offset(size.width / 2, size.height / 2);
     final radius = size.width / 2 - 2;
+    // A dark outline under the ring: this fallback is drawn over the live feed,
+    // and a 2.4 dp pale circle disappeared against a bright wall.
+    canvas.drawCircle(
+      centre,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 7.5
+        ..color = Colors.black.withValues(alpha: 0.5),
+    );
     final ring = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.4
-      ..color = color.withValues(alpha: 0.85);
+      ..strokeWidth = 4
+      ..color = color.withValues(alpha: 0.92);
     canvas.drawCircle(centre, radius, ring);
 
     final tick = Paint()
-      ..strokeWidth = 2
+      ..strokeWidth = 2.6
       ..strokeCap = StrokeCap.round
-      ..color = color.withValues(alpha: 0.6);
+      ..color = color.withValues(alpha: 0.75);
     for (var i = 0; i < 4; i++) {
       final angle = i * math.pi / 2;
       final inner = radius - 9;
@@ -126,8 +136,8 @@ class _FallbackReticlePainter extends CustomPainter {
     }
     canvas.drawCircle(
       centre,
-      2.6,
-      Paint()..color = color.withValues(alpha: 0.9),
+      3.4,
+      Paint()..color = color.withValues(alpha: 0.95),
     );
 
     final arc = progress.clamp(0.0, 1.0);
@@ -139,7 +149,7 @@ class _FallbackReticlePainter extends CustomPainter {
         false,
         Paint()
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 5
+          ..strokeWidth = 6
           ..strokeCap = StrokeCap.round
           ..color = CaptureColors.ok,
       );

@@ -3,6 +3,20 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
+
+/// The world-up axis of Android's `TYPE_ROTATION_VECTOR` frame.
+///
+/// Android's sensor world frame is **East–North–Up**: `+X` roughly east, `+Y`
+/// roughly magnetic north, **`+Z` up**. It is *not* the `+Y`-up frame this
+/// project's own pose helpers (`Quat.fromYawPitch`, `Quat.yawPitch`) are written
+/// in. The quaternion composition `q⁻¹·(q₀·v)` does not care — a change of
+/// basis cancels — but levelling does: projecting a heading with `y = 0` in an
+/// ENU frame drops the *north* component instead of the vertical one and leaves
+/// a rotation about the north axis, i.e. a roll. That single mistake tilted
+/// every target 90° away from the room, so the axis is declared here and passed
+/// explicitly wherever it is used.
+const Vec3 kAndroidSensorWorldUp = Vec3(0, 0, 1);
 
 /// The device-rotation stream the 3DoF architecture runs on.
 ///
@@ -12,6 +26,14 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quate
 abstract class RotationSource {
   /// Device → world quaternions, in the Android sensor frame.
   Stream<Quat> get rotations;
+
+  /// The world-up axis of the frame [rotations] are reported in.
+  ///
+  /// Defaults to `+Y`, which is what this project's own `Quat.fromYawPitch`
+  /// helpers assume, so a synthetic source in a test behaves like the rest of
+  /// the maths. [NativeRotationSource] overrides it with
+  /// [kAndroidSensorWorldUp] because the hardware reports ENU.
+  Vec3 get worldUp => Vec3.unitY;
 
   /// Starts the platform sensor. Idempotent.
   Future<void> start();
@@ -42,6 +64,10 @@ class NativeRotationSource implements RotationSource {
 
   @override
   Stream<Quat> get rotations => _out.stream;
+
+  /// Android reports ENU, so levelling must use `+Z` as up — not `+Y`.
+  @override
+  Vec3 get worldUp => kAndroidSensorWorldUp;
 
   bool get isRunning => _subscription != null;
 

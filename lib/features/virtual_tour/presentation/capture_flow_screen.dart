@@ -6,6 +6,7 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/scre
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/screens/plan_screens.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/screens/review_screens.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/screens/station_setup_screen.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/widgets/flow_widgets.dart';
 
 /// The capture flow, screens 1–9 of `360° Capture Prototype.html`.
 ///
@@ -110,11 +111,19 @@ class _CaptureFlowScreenState extends State<CaptureFlowScreen>
     super.dispose();
   }
 
+  /// Re-arms the boot after a failure. The controller is still null, so
+  /// `_boot()` runs again rather than returning early.
+  void _retryBoot() {
+    if (!mounted) return;
+    setState(() => _bootError = null);
+    _boot();
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = _c;
     if (_bootError != null) {
-      return _BootFailure(message: _bootError!);
+      return _BootFailure(message: _bootError!, onRetry: _retryBoot);
     }
     if (c == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -158,28 +167,120 @@ class _CaptureFlowScreenState extends State<CaptureFlowScreen>
 /// which is a supported configuration and gets an explanation, not a stack
 /// trace.
 class _BootFailure extends StatelessWidget {
-  const _BootFailure({required this.message});
+  const _BootFailure({required this.message, this.onRetry});
 
+  /// The raw exception. It is **not** the main message: a user cannot act on a
+  /// stack-trace string, so it is kept behind a disclosure and the screen leads
+  /// with what happened and what to do about it.
   final String message;
+
+  final VoidCallback? onRetry;
+
+  /// A sentence about the likely cause, chosen from the exception's own words.
+  String get _explanation {
+    final m = message.toLowerCase();
+    if (m.contains('permission') || m.contains('denied')) {
+      return 'SiteWise needs the camera to capture a station. Allow camera '
+          'access in Android settings, then try again.';
+    }
+    if (m.contains('camera') || m.contains('in use')) {
+      return 'The camera could not be opened. Another app may be using it — '
+          'close the other app and try again.';
+    }
+    return 'The capture session could not start. Your saved stations are not '
+        'affected.';
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    backgroundColor: SiteWiseColors.paper,
     body: SafeArea(
       child: Center(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.no_photography_outlined, size: 48),
-              const SizedBox(height: 16),
-              const Text(
-                'Capture could not start',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              Text(message, textAlign: TextAlign.center),
-            ],
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: SiteWiseColors.softBlue,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  alignment: Alignment.center,
+                  child: const Icon(
+                    Icons.no_photography_outlined,
+                    size: 28,
+                    color: SiteWiseColors.primary,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Capture could not start',
+                  style: TextStyle(
+                    color: SiteWiseColors.ink,
+                    fontSize: 21,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.3,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  _explanation,
+                  style: const TextStyle(
+                    color: SiteWiseColors.muted,
+                    fontSize: 14,
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                if (onRetry != null) ...[
+                  PrimaryButton(label: 'Try again', onPressed: onRetry),
+                  const SizedBox(height: 8),
+                ],
+                SecondaryButton(
+                  label: 'Close',
+                  onPressed: () => Navigator.of(context).maybePop(),
+                  onLight: true,
+                ),
+                const SizedBox(height: 14),
+                Theme(
+                  data: Theme.of(
+                    context,
+                  ).copyWith(dividerColor: Colors.transparent),
+                  child: ExpansionTile(
+                    tilePadding: EdgeInsets.zero,
+                    childrenPadding: const EdgeInsets.only(bottom: 8),
+                    title: const Text(
+                      'Technical details',
+                      style: TextStyle(
+                        color: SiteWiseColors.muted,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    children: [
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          message,
+                          style: const TextStyle(
+                            color: SiteWiseColors.muted,
+                            fontSize: 12,
+                            height: 1.4,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

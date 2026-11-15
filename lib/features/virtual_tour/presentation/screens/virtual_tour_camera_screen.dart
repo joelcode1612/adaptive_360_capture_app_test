@@ -1104,112 +1104,119 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
     final total = _engine?.totalCount ?? VirtualTourLayout.nodeCount;
     final drift = guidance?.driftM ?? 0;
 
-    return PopScope(
-      canPop: true,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: Stack(
-          fit: StackFit.expand,
-          children: <Widget>[
-            Texture(textureId: _textureId!, filterQuality: FilterQuality.none),
-            VirtualTourOverlay(
-              triangles: _triangles,
-              revision: _revision,
-              modelsReady: _modelsReady,
-              failureReason: _modelFailure,
-              hudColor: hudColor,
-              holdProgress: guidance?.holdProgress ?? 0,
-              topInset: topPadding + 64,
-            ),
-            Positioned(
-              left: 12,
-              right: 12,
-              top: topPadding + 8,
-              child: _TopBar(
-                captured: captured,
-                total: total,
-                driftM: drift,
-                driftLimitM: _engine?.maxDriftM ?? 0.20,
-                tracking: _tracking,
-                onClose: _close,
+    return Theme(
+      // Dark camera chrome, whatever the app's default theme is.
+      data: captureAppTheme(),
+      child: PopScope(
+        canPop: true,
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              Texture(
+                textureId: _textureId!,
+                filterQuality: FilterQuality.none,
               ),
-            ),
-            Positioned(
-              left: 12,
-              right: 12,
-              top: topPadding + 74,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  if (widget.diagnosticsEnabled)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _DiagnosticsPanel(
-                        tracking: _tracking,
-                        planeCount: _lastPose?.planeCount ?? 0,
-                        failureReason: _lastPose?.failureReason,
-                        guidance: guidance,
-                        cameraPosition: _lastPose?.position,
-                        stationPosition: _engine?.startPosition,
-                        poseAge: _now() - _lastPoseAt,
-                        savedCount: _photoPaths.length,
-                        latestError:
-                            _captureError ??
-                            _engine?.lastCaptureError ??
-                            _arFault,
-                        errorCategory: _lastErrorCategory,
-                        errorFrame: _lastErrorFrame,
-                      ),
-                    ),
-                  if (_recoveryRequired)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _RecoveryBanner(
-                        message:
-                            _arFault ??
-                            'AR must be restarted before capture can continue.',
-                        onRecalibrate: _recalibrate,
-                      ),
-                    )
-                  else if (_arFault != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _ArFaultBanner(message: _arFault!),
-                    ),
-                  if (!_recoveryRequired &&
-                      guidance?.blocker == VirtualTourCaptureBlocker.drift)
-                    const _DriftBanner(),
-                ],
-              ),
-            ),
-            Align(
-              alignment: Alignment.bottomCenter,
-              child: _HudPanel(
-                guidance: guidance,
-                tracking: _tracking,
-                captured: captured,
-                total: total,
-                driftM: drift,
-                driftLimitM: _engine?.maxDriftM ?? 0.20,
-                capturing: _activeAttempt != null,
-                captureError: _captureError,
+              VirtualTourOverlay(
+                triangles: _triangles,
+                revision: _revision,
+                modelsReady: _modelsReady,
+                failureReason: _modelFailure,
                 hudColor: hudColor,
-                modelsFailed: _modelFailure != null,
-                onManualRetry: _manualRetry,
+                holdProgress: guidance?.holdProgress ?? 0,
+                topInset: topPadding + 64,
               ),
-            ),
-            BlocBuilder<VirtualTourBloc, VirtualTourState>(
-              bloc: _bloc!,
-              builder: (BuildContext context, VirtualTourState state) =>
-                  _UploadOverlay(
-                    state: state,
-                    onRetry: _retry,
-                    onSubmit: _submit,
-                    onDone: _close,
-                  ),
-            ),
-          ],
+              Positioned(
+                left: 12,
+                right: 12,
+                top: topPadding + 8,
+                child: _TopBar(
+                  captured: captured,
+                  total: total,
+                  driftM: drift,
+                  driftLimitM: _engine?.maxDriftM ?? 0.20,
+                  tracking: _tracking,
+                  onClose: _close,
+                ),
+              ),
+              Positioned(
+                left: 12,
+                right: 12,
+                top: topPadding + 74,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    if (widget.diagnosticsEnabled)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: _DiagnosticsPanel(
+                          tracking: _tracking,
+                          planeCount: _lastPose?.planeCount ?? 0,
+                          failureReason: _lastPose?.failureReason,
+                          guidance: guidance,
+                          cameraPosition: _lastPose?.position,
+                          stationPosition: _engine?.startPosition,
+                          poseAge: _now() - _lastPoseAt,
+                          savedCount: _photoPaths.length,
+                          latestError:
+                              _captureError ??
+                              _engine?.lastCaptureError ??
+                              _arFault,
+                          errorCategory: _lastErrorCategory,
+                          errorFrame: _lastErrorFrame,
+                        ),
+                      ),
+                    if (_recoveryRequired)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: _RecoveryBanner(
+                          message:
+                              _arFault ??
+                              'AR must be restarted before capture can continue.',
+                          onRecalibrate: _recalibrate,
+                        ),
+                      )
+                    else if (_arFault != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: _ArFaultBanner(message: _arFault!),
+                      ),
+                    if (!_recoveryRequired &&
+                        guidance?.blocker == VirtualTourCaptureBlocker.drift)
+                      const _DriftBanner(),
+                  ],
+                ),
+              ),
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: _HudPanel(
+                  guidance: guidance,
+                  tracking: _tracking,
+                  captured: captured,
+                  total: total,
+                  driftM: drift,
+                  driftLimitM: _engine?.maxDriftM ?? 0.20,
+                  capturing: _activeAttempt != null,
+                  captureError: _captureError,
+                  hudColor: hudColor,
+                  modelsFailed: _modelFailure != null,
+                  onManualRetry: _manualRetry,
+                ),
+              ),
+              BlocBuilder<VirtualTourBloc, VirtualTourState>(
+                bloc: _bloc!,
+                builder: (BuildContext context, VirtualTourState state) =>
+                    _UploadOverlay(
+                      state: state,
+                      onRetry: _retry,
+                      onSubmit: _submit,
+                      onDone: _close,
+                    ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1238,82 +1245,90 @@ class _TopBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final driftOk = driftM < driftLimitM;
+    final trackingOk = tracking == TrackingState.tracking;
     return Row(
       children: <Widget>[
-        _RoundButton(icon: Icons.close, label: 'Close', onTap: onClose),
+        _RoundButton(
+          icon: Icons.close,
+          label: 'Close AR capture',
+          onTap: onClose,
+        ),
         const SizedBox(width: 10),
         Expanded(
           child: Container(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            padding: const EdgeInsets.fromLTRB(14, 9, 14, 9),
             decoration: BoxDecoration(
-              color: CaptureColors.chromeOverlay(0.9),
-              borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-              border: Border.all(color: CaptureColors.hairlineOnDark),
+              color: CaptureColors.inkOverlay(0.82),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: CaptureColors.hairlineChip),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  '$captured / $total captured',
+                  '$captured of $total photos saved',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
                   ),
                 ),
-                Text(
-                  '30 world-locked nodes · ${_trackingLabel(tracking)}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: CaptureColors.mutedOnDark,
-                    fontSize: 10,
-                  ),
+                const SizedBox(height: 2),
+                Row(
+                  children: <Widget>[
+                    Icon(
+                      trackingOk
+                          ? Icons.check_circle_outline
+                          : Icons.gps_off_outlined,
+                      size: 14,
+                      color: trackingOk ? CaptureColors.ok : CaptureColors.warn,
+                    ),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text(
+                        trackingOk
+                            ? 'Camera tracking'
+                            : 'Move your phone slowly to restore tracking',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: trackingOk
+                              ? SiteWiseColors.cameraInk
+                              : CaptureColors.warn,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
           ),
         ),
-        const SizedBox(width: 8),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          decoration: BoxDecoration(
-            color: CaptureColors.chromeOverlay(0.9),
-            borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-            border: Border.all(
-              color: driftOk
-                  ? CaptureColors.hairlineOnDark
-                  : CaptureColors.warn.withValues(alpha: 0.8),
+        // The exact offset is a diagnostic; it only earns screen space when it
+        // is the reason the shutter is refusing.
+        if (!driftOk) ...<Widget>[
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: CaptureColors.inkOverlay(0.82),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: CaptureColors.warn),
+            ),
+            child: const Text(
+              'Return to start',
+              style: TextStyle(
+                color: CaptureColors.warn,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
             ),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: <Widget>[
-              const Text(
-                'DRIFT',
-                style: TextStyle(
-                  color: CaptureColors.mutedOnDark,
-                  fontSize: 9,
-                  letterSpacing: 0.6,
-                ),
-              ),
-              Text(
-                '${driftM.toStringAsFixed(2)} / '
-                '${driftLimitM.toStringAsFixed(2)} m',
-                style: TextStyle(
-                  color: driftOk ? Colors.white : CaptureColors.warn,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const <FontFeature>[
-                    FontFeature.tabularFigures(),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
+        ],
       ],
     );
   }
@@ -1335,14 +1350,17 @@ class _RoundButton extends StatelessWidget {
     button: true,
     label: label,
     child: Material(
-      color: CaptureColors.chromeOverlay(0.9),
+      color: CaptureColors.inkOverlay(0.82),
       shape: const CircleBorder(),
       child: InkWell(
         customBorder: const CircleBorder(),
         onTap: onTap,
         child: SizedBox.square(
-          dimension: CaptureMetrics.headerIconSize + 8,
-          child: Icon(icon, color: Colors.white, size: 20),
+          // 48 dp, the accessibility floor. It was 40 dp, which is under the
+          // minimum a thumb can reliably hit while the other hand holds a phone
+          // up to a wall.
+          dimension: CaptureMetrics.minTouchTarget,
+          child: Icon(icon, color: Colors.white, size: 22),
         ),
       ),
     ),
@@ -1387,139 +1405,174 @@ class _HudPanel extends StatelessWidget {
     final hold = guidance?.readyToCapture == true
         ? 1.0
         : guidance?.holdProgress ?? 0.0;
+    final failed = guidance?.state == VirtualTourCaptureState.captureFailed;
+    final retry = guidance?.requiresManualRetry == true;
 
-    return Container(
-      width: double.infinity,
-      color: CaptureColors.cameraChrome,
+    // What the user should do, in the state table's words. The engine owns the
+    // instruction sentence; this line only says what the *gesture* is, so the
+    // two cannot contradict each other.
+    final hint = switch (guidance?.state) {
+      VirtualTourCaptureState.capturing ||
+      VirtualTourCaptureState.validatingImage ||
+      VirtualTourCaptureState.savingImage => 'Taking photo…',
+      VirtualTourCaptureState.captureSucceeded => 'Photo saved.',
+      VirtualTourCaptureState.waitingForStability => 'Hold your phone steady.',
+      VirtualTourCaptureState.aligning ||
+      VirtualTourCaptureState.readyForAlignment =>
+        'Move the marker into the centre circle.',
+      VirtualTourCaptureState.trackingUnavailable ||
+      VirtualTourCaptureState.awaitingTrackingRecovery =>
+        'Move your phone slowly to scan the room.',
+      _ => aligned ? 'Hold your phone steady.' : 'Find the target marker.',
+    };
+
+    final pill = switch (guidance?.state) {
+      VirtualTourCaptureState.captureSucceeded ||
+      VirtualTourCaptureState.completed => (
+        label: 'Saved',
+        color: CaptureColors.okOnLight,
+      ),
+      VirtualTourCaptureState.captureFailed => (
+        label: 'Capture failed',
+        color: CaptureColors.warnOnLight,
+      ),
+      VirtualTourCaptureState.capturing ||
+      VirtualTourCaptureState.validatingImage ||
+      VirtualTourCaptureState.savingImage => (
+        label: 'Taking photo',
+        color: CaptureColors.okOnLight,
+      ),
+      VirtualTourCaptureState.trackingUnavailable ||
+      VirtualTourCaptureState.awaitingTrackingRecovery => (
+        label: 'Tracking lost',
+        color: CaptureColors.warnOnLight,
+      ),
+      _ => (label: 'Align the marker', color: CaptureColors.primary),
+    };
+
+    return Material(
+      color: SiteWiseColors.surface,
+      borderRadius: const BorderRadius.vertical(
+        top: Radius.circular(CaptureMetrics.footerRadius),
+      ),
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+          padding: const EdgeInsets.fromLTRB(18, 15, 18, 14),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
-              ClipRRect(
-                borderRadius: BorderRadius.circular(2),
-                child: LinearProgressIndicator(
-                  value: total == 0 ? 0 : captured / total,
-                  minHeight: 3,
-                  backgroundColor: CaptureColors.trackOnDark,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    CaptureColors.ok,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 10),
               Row(
                 children: <Widget>[
-                  _PhaseChip(
-                    label: _phaseLabel(guidance, capturing, tracking),
-                    color: hudColor,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      guidance?.target?.label ?? 'All targets captured',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: CaptureColors.mutedOnDark,
-                        fontSize: 11,
-                      ),
+                  _PhaseChip(label: pill.label, color: pill.color),
+                  const Spacer(),
+                  Text(
+                    '$captured of $total saved',
+                    style: const TextStyle(
+                      color: SiteWiseColors.muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
-              Text(
-                instruction,
-                maxLines: 3,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 17,
-                  height: 1.25,
-                  fontWeight: FontWeight.w600,
+              const SizedBox(height: 10),
+              // One instruction, announced once per state change. A screen
+              // reader hears "Move the marker into the centre circle", not a
+              // stream of orientation updates.
+              Semantics(
+                liveRegion: true,
+                label: '$instruction $hint',
+                child: ExcludeSemantics(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Text(
+                        instruction,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: SiteWiseColors.ink,
+                          fontSize: 18,
+                          height: 1.25,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        hint,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: failed
+                              ? CaptureColors.warnOnLight
+                              : SiteWiseColors.muted,
+                          fontSize: 13,
+                          height: 1.3,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-              const SizedBox(height: 10),
+              const SizedBox(height: 12),
               ClipRRect(
-                borderRadius: BorderRadius.circular(3),
+                borderRadius: BorderRadius.circular(4),
                 child: LinearProgressIndicator(
                   value: hold,
-                  minHeight: 6,
-                  backgroundColor: CaptureColors.trackOnDark,
+                  minHeight: 7,
+                  backgroundColor: CaptureColors.trackOnLight,
                   valueColor: AlwaysStoppedAnimation<Color>(
-                    aligned ? CaptureColors.ok : CaptureColors.mutedOnDark,
+                    aligned ? CaptureColors.okOnLight : CaptureColors.primary,
                   ),
                 ),
               ),
-              const SizedBox(height: 8),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: Text(
-                      'Automatic capture inside 3.0° · hold 0.60 s · '
-                      'still ≤ 3°/s',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: CaptureColors.mutedOnDark,
-                        fontSize: 10,
-                      ),
-                    ),
+              if (captureError != null) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  captureError!,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: CaptureColors.warnOnLight,
+                    fontSize: 12,
+                    height: 1.3,
                   ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '${driftM.toStringAsFixed(2)} m / '
-                    '${driftLimitM.toStringAsFixed(2)} m drift',
-                    style: TextStyle(
-                      color: driftM < driftLimitM
-                          ? CaptureColors.mutedOnDark
-                          : CaptureColors.warn,
-                      fontSize: 10,
-                    ),
-                  ),
-                ],
-              ),
+                ),
+              ],
               if (modelsFailed) ...<Widget>[
                 const SizedBox(height: 6),
                 const Text(
-                  'The GLB markers could not be drawn — the drawn reticle is '
-                  'standing in for them. Capture is still possible.',
+                  'The 3D marker could not be drawn — the drawn circle is '
+                  'standing in for it. Capture still works.',
                   style: TextStyle(
-                    color: CaptureColors.warn,
-                    fontSize: 10,
+                    color: SiteWiseColors.muted,
+                    fontSize: 12,
                     height: 1.3,
                   ),
                 ),
               ],
-              if (captureError != null) ...<Widget>[
-                const SizedBox(height: 6),
-                Text(
-                  captureError!,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: CaptureColors.warn,
-                    fontSize: 11,
-                    height: 1.3,
-                  ),
-                ),
-              ],
-              if (guidance?.requiresManualRetry == true) ...<Widget>[
-                const SizedBox(height: 8),
+              if (retry) ...<Widget>[
+                const SizedBox(height: 10),
                 Align(
-                  alignment: Alignment.centerLeft,
-                  child: OutlinedButton.icon(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton.icon(
                     onPressed: capturing ? null : onManualRetry,
-                    icon: const Icon(Icons.refresh, size: 16),
+                    icon: const Icon(Icons.refresh, size: 18),
                     label: const Text('Retry this target'),
-                    style: OutlinedButton.styleFrom(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: CaptureColors.primary,
                       foregroundColor: Colors.white,
-                      side: const BorderSide(
-                        color: CaptureColors.hairlineOnDark,
+                      overlayColor: CaptureColors.primaryPressed,
+                      minimumSize: const Size(0, CaptureMetrics.minTouchTarget),
+                      padding: const EdgeInsets.symmetric(horizontal: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      textStyle: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
                   ),
@@ -1707,19 +1760,21 @@ class _PhaseChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
     decoration: BoxDecoration(
-      color: color.withValues(alpha: 0.16),
-      borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-      border: Border.all(color: color.withValues(alpha: 0.55)),
+      color: color.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(100),
+      border: Border.all(color: color.withValues(alpha: 0.38)),
     ),
     child: Text(
       label,
       style: TextStyle(
         color: color,
-        fontSize: 10,
-        fontWeight: FontWeight.w600,
-        letterSpacing: 0.3,
+        // 12 dp, not the 10 dp the first port used: this chip is the only
+        // thing that says what the shutter is doing.
+        fontSize: 12,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.2,
       ),
     ),
   );
@@ -1742,10 +1797,9 @@ class _DriftBanner extends StatelessWidget {
         SizedBox(width: 8),
         Expanded(
           child: Text(
-            'Step back toward the point where you started. The markers stay '
-            'where they are; the shutter is blocked until you are within '
-            '0.20 m.',
-            style: TextStyle(color: Colors.white, fontSize: 11, height: 1.35),
+            'Step back toward where you started. The markers stay put, and the '
+            'shutter waits until you are back at the station.',
+            style: TextStyle(color: Colors.white, fontSize: 13, height: 1.35),
           ),
         ),
       ],
@@ -1774,23 +1828,32 @@ class _RecoveryBanner extends StatelessWidget {
         Expanded(
           child: Text(
             message,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
+            // No `maxLines`: a recovery instruction that ends in an ellipsis is
+            // an instruction the user cannot follow.
             style: const TextStyle(
               color: Colors.white,
-              fontSize: 11,
+              fontSize: 13,
               height: 1.35,
             ),
           ),
         ),
         const SizedBox(width: 8),
-        TextButton(
+        FilledButton(
           onPressed: onRecalibrate,
-          style: TextButton.styleFrom(
+          style: FilledButton.styleFrom(
+            backgroundColor: CaptureColors.danger,
             foregroundColor: Colors.white,
-            backgroundColor: CaptureColors.danger.withValues(alpha: 0.22),
+            minimumSize: const Size(0, CaptureMetrics.minTouchTarget),
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+            textStyle: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
           ),
-          child: const Text('Recalibrate', style: TextStyle(fontSize: 11)),
+          child: const Text('Restart tracking'),
         ),
       ],
     ),
@@ -1817,11 +1880,9 @@ class _ArFaultBanner extends StatelessWidget {
         Expanded(
           child: Text(
             message,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: Colors.white,
-              fontSize: 11,
+              fontSize: 13,
               height: 1.35,
             ),
           ),
@@ -2088,88 +2149,58 @@ class _BootFailure extends StatelessWidget {
   final VoidCallback? onRetry;
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: CaptureColors.cameraChrome,
-    body: SafeArea(
-      child: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              const Icon(Icons.threesixty, size: 48, color: Colors.white70),
-              const SizedBox(height: 16),
-              const Text(
-                'The virtual tour could not start',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: CaptureColors.mutedOnDark,
-                  height: 1.4,
-                ),
-              ),
-              const SizedBox(height: 20),
-              if (permissionDenied) ...<Widget>[
-                FilledButton(
-                  onPressed: () => PermissionService().openSettings(),
-                  child: const Text('Open settings'),
+  Widget build(BuildContext context) => Theme(
+    data: captureAppTheme(),
+    child: Scaffold(
+      backgroundColor: CaptureColors.cameraChrome,
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                const Icon(Icons.threesixty, size: 48, color: Colors.white70),
+                const SizedBox(height: 16),
+                const Text(
+                  'The virtual tour could not start',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
                 const SizedBox(height: 8),
-              ],
-              if (onRetry != null) ...<Widget>[
-                FilledButton(
-                  onPressed: onRetry,
-                  child: const Text('Try again'),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: CaptureColors.mutedOnDark,
+                    height: 1.4,
+                  ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 20),
+                if (permissionDenied) ...<Widget>[
+                  FilledButton(
+                    onPressed: () => PermissionService().openSettings(),
+                    child: const Text('Open settings'),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                if (onRetry != null) ...<Widget>[
+                  FilledButton(
+                    onPressed: onRetry,
+                    child: const Text('Try again'),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                OutlinedButton(onPressed: onClose, child: const Text('Back')),
               ],
-              OutlinedButton(onPressed: onClose, child: const Text('Back')),
-            ],
+            ),
           ),
         ),
       ),
     ),
   );
-}
-
-String _trackingLabel(TrackingState tracking) => switch (tracking) {
-  TrackingState.tracking => 'AR tracking OK',
-  TrackingState.initialising => 'AR starting',
-  TrackingState.paused => 'AR paused',
-  TrackingState.stopped => 'AR stopped',
-  TrackingState.unavailable => 'AR unavailable',
-};
-
-String _phaseLabel(
-  VirtualTourGuidance? guidance,
-  bool capturing,
-  TrackingState tracking,
-) {
-  if (capturing) return 'CAPTURE';
-  if (guidance == null) {
-    return tracking == TrackingState.tracking ? 'SETTING UP' : 'STARTING';
-  }
-  return switch (guidance.state) {
-    VirtualTourCaptureState.trackingUnavailable => 'STARTING',
-    VirtualTourCaptureState.readyForAlignment => 'ALIGN',
-    VirtualTourCaptureState.aligning => 'ALIGN',
-    VirtualTourCaptureState.waitingForStability => 'HOLD',
-    VirtualTourCaptureState.capturing => 'CAPTURE',
-    VirtualTourCaptureState.validatingImage => 'CHECK',
-    VirtualTourCaptureState.savingImage => 'SAVE',
-    VirtualTourCaptureState.captureSucceeded => 'SAVED',
-    VirtualTourCaptureState.captureFailed =>
-      guidance.requiresManualRetry ? 'RETRY' : 'FAILED',
-    VirtualTourCaptureState.awaitingTrackingRecovery => 'RECOVER',
-    VirtualTourCaptureState.completed => 'DONE',
-  };
 }

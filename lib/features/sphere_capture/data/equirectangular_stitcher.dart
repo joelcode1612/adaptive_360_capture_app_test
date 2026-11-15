@@ -8,8 +8,9 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'package:path/path.dart' as p;
 
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/equirect_bounds.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
-import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 
 /// A guaranteed full-sphere equirectangular panorama from the 3DoF captures.
 ///
@@ -34,7 +35,7 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vecto
 /// blends only where the best and second-best weights are within 3% — a narrow
 /// seam band, not a double exposure.
 ///
-/// The whole projection runs in a background isolate: 38 frames take several
+/// The whole projection runs in a background isolate: 26 frames take several
 /// seconds and must not block the Flutter UI thread (the previous on-thread
 /// stitch caused an ANR).
 class EquirectangularStitcher implements PanoramaStitcher {
@@ -60,10 +61,16 @@ class EquirectangularStitcher implements PanoramaStitcher {
       );
     }
     final outPath = p.join(stationDir, 'panorama.jpg');
-    onStage?.call('Projecting ${imagePaths.length} photographs…');
+    // ReceivePort reports progress from the compute isolate without blocking UI.
+    final progressPort = ReceivePort();
+    final progressSubscription = progressPort.listen((dynamic message) {
+      if (message is String) onStage?.call(message);
+    });
+    onStage?.call('Preparing ${imagePaths.length} photographs…');
     try {
       final result = await Isolate.run(
-        () => _projectEquirect(stationDir, outPath, width),
+        () =>
+            _projectEquirect(stationDir, outPath, width, progressPort.sendPort),
       );
       if (!result.ok) return StitchResult.failure(result.message);
       return StitchResult(
@@ -73,6 +80,9 @@ class EquirectangularStitcher implements PanoramaStitcher {
       );
     } catch (error) {
       return StitchResult.failure('Panorama projection failed: $error');
+    } finally {
+      await progressSubscription.cancel();
+      progressPort.close();
     }
   }
 }
@@ -82,7 +92,9 @@ class EquirectangularStitcher implements PanoramaStitcher {
   String stationDir,
   String outPath,
   int width,
+  SendPort progress,
 ) {
+  final stopwatch = Stopwatch()..start();
   final recordsFile = File(p.join(stationDir, 'records.json'));
   final raw = jsonDecode(recordsFile.readAsStringSync());
   if (raw is! List || raw.isEmpty) {
@@ -103,6 +115,10 @@ class EquirectangularStitcher implements PanoramaStitcher {
   final bestColour = Uint8List(width * height * 3);
   final secondWeight = Float32List(width * height);
   final secondColour = Uint8List(width * height * 3);
+  // How many frames actually see each pixel. Saturating at 3: the audit only
+  // reports single/double/triple coverage, and a fourth contributor would not
+  // change any of those three numbers.
+  final hits = Uint8List(width * height);
 
   final sinLon = Float64List(width);
   final cosLon = Float64List(width);
@@ -119,12 +135,22 @@ class EquirectangularStitcher implements PanoramaStitcher {
     cosLat[y] = math.cos(lat);
   }
 
-  for (final record in records) {
+  // Decode JPEGs at a resolution appropriate for the output. A 2048-wide
+  // equirectangular panorama does not need 38 full-resolution 12 MP buffers.
+  // OpenCV's reduced decoder uses scaled-IDCT, reducing allocations/decoding.
+  // Preserve more detail for optional higher-resolution panoramas.
+  final decodeFlag = width <= 2048
+      ? cv.IMREAD_REDUCED_COLOR_4
+      : width <= 4096
+      ? cv.IMREAD_REDUCED_COLOR_2
+      : cv.IMREAD_COLOR;
+  for (var frameIndex = 0; frameIndex < records.length; frameIndex++) {
+    final record = records[frameIndex];
     final path = record['imagePath'] as String?;
     if (path == null || !File(path).existsSync()) {
       return (ok: false, message: 'A captured photograph is missing: $path');
     }
-    final mat = cv.imread(path, flags: cv.IMREAD_COLOR);
+    final mat = cv.imread(path, flags: decodeFlag);
     if (mat.isEmpty) {
       mat.dispose();
       return (ok: false, message: 'A photograph could not be decoded: $path');
@@ -139,14 +165,28 @@ class EquirectangularStitcher implements PanoramaStitcher {
 
       final imageWidth = mat.cols;
       final imageHeight = mat.rows;
+      // The still's focal length in pixels, from the one documented FOV
+      // assumption the overlay also uses. The previous `0.75 × longest side`
+      // was an unexplained constant that happened to imply 53° horizontal on a
+      // 4:3 frame; deriving it from `kSphereAssumedVerticalFovDeg` means the
+      // aiming graphics and the panorama cannot disagree about the lens.
+      // A centred crop keeps the focal length and moves the principal point to
+      // the crop centre, so the focal comes from the *uncropped* frame the
+      // record kept. Records written before that field existed fall back to the
+      // decoded height, which is exact when no crop was applied.
+      final sourceHeight =
+          (record['sourceImageHeight'] as num?)?.toInt() ?? imageHeight;
       final focal =
-          0.75 * (imageWidth > imageHeight ? imageWidth : imageHeight);
+          (sourceHeight / 2) /
+          math.tan(kSphereAssumedVerticalFovDeg * math.pi / 360);
       final cx = imageWidth / 2;
       final cy = imageHeight / 2;
       final pixels = mat.data;
       final rowStride = imageWidth * 3;
+      final marginX = 0.05 * imageWidth;
+      final marginY = 0.05 * imageHeight;
 
-      final bounds = _lonLatBounds(
+      final bounds = equirectFrameBounds(
         cameraToSphere,
         imageWidth,
         imageHeight,
@@ -168,15 +208,17 @@ class EquirectangularStitcher implements PanoramaStitcher {
         0,
         height - 1,
       );
-      final fullWidth =
-          bounds.span >= 3.0 ||
-          cameraToSphere.rotate(const Vec3(0, 0, -1)).y.abs() > 0.8;
-      final xStart = fullWidth
+      // `minLon`/`maxLon` are unwrapped around the frame's own centre, so a
+      // frame that straddles ±180° still has `minLon <= maxLon` and a span
+      // below 2π. The column range may therefore fall outside [0, width) —
+      // that is the wrap, and the `% width` in the loop handles it. A frame
+      // that contains a pole covers every longitude and is marked full-width.
+      final xStart = bounds.fullWidth
           ? 0
           : ((bounds.minLon + 3.141592653589793) / 6.283185307179586 * width)
                     .floor() -
                 2;
-      final xEnd = fullWidth
+      final xEnd = bounds.fullWidth
           ? width - 1
           : ((bounds.maxLon + 3.141592653589793) / 6.283185307179586 * width)
                     .ceil() +
@@ -193,7 +235,9 @@ class EquirectangularStitcher implements PanoramaStitcher {
         final dy = sinLat[y];
         final dxz = cosLat[y];
         for (var xi = xStart; xi <= xEnd; xi++) {
-          final x = ((xi % width) + width) % width;
+          // The longitude interval extends by at most one panorama wrap.
+          // Avoid two integer modulo operations in the hot pixel loop.
+          final x = xi < 0 ? xi + width : (xi >= width ? xi - width : xi);
           final dx = sinLon[x] * dxz;
           final dz = -cosLon[x] * dxz;
           // v' = v + 2w(u×v) + 2u×(u×v), inlined.
@@ -247,13 +291,12 @@ class EquirectangularStitcher implements PanoramaStitcher {
           );
 
           var weight = _pow6(depth);
-          final marginX = 0.05 * imageWidth;
-          final marginY = 0.05 * imageHeight;
           weight *= _smoothStep(_min(u, imageWidth - 1 - u) / marginX);
           weight *= _smoothStep(_min(v, imageHeight - 1 - v) / marginY);
           if (weight <= 0) continue;
 
           final index = y * width + x;
+          if (hits[index] < 3) hits[index]++;
           if (weight > bestWeight[index]) {
             secondWeight[index] = bestWeight[index];
             secondColour[index * 3] = bestColour[index * 3];
@@ -274,16 +317,19 @@ class EquirectangularStitcher implements PanoramaStitcher {
     } finally {
       mat.dispose();
     }
+    progress.send(
+      'Projecting photographs: ${frameIndex + 1}/${records.length} '
+      '(${stopwatch.elapsed.inSeconds}s elapsed)…',
+    );
   }
 
+  progress.send('Blending panorama and encoding JPEG…');
   // Nearest frame per pixel, with a narrow seam blend where the top two
   // weights are almost equal.
   final output = Uint8List(width * height * 3);
-  var covered = 0;
   for (var i = 0; i < width * height; i++) {
     final best = bestWeight[i];
     if (best <= 1e-4) continue;
-    covered++;
     final second = secondWeight[i];
     if (second > 0.97 * best) {
       final total = best + second;
@@ -302,12 +348,57 @@ class EquirectangularStitcher implements PanoramaStitcher {
       output[i * 3 + 2] = bestColour[i * 3 + 2];
     }
   }
-  if (covered < width * height * 0.9) {
+  // ── Coverage audit ──────────────────────────────────────────────────
+  //
+  // Equirectangular rows are not equal-area: a row at latitude φ covers only
+  // cos(φ) of what an equatorial row does. Counting pixels would overstate
+  // coverage near the poles — which is exactly where the 26-target layout used
+  // to leave holes — so every number below is area-weighted.
+  //
+  // `single` is the one that decides success: every direction of the finished
+  // sphere must come from a real photograph. The previous gate accepted 90%,
+  // which let a ten-percent black band pass as a finished panorama.
+  var totalArea = 0.0;
+  var singleArea = 0.0;
+  var doubleArea = 0.0;
+  var tripleArea = 0.0;
+  var worstRowWeight = -1.0;
+  var worstLat = 0.0;
+  var worstLon = 0.0;
+  for (var y = 0; y < height; y++) {
+    final rowWeight = cosLat[y];
+    totalArea += rowWeight * width;
+    for (var x = 0; x < width; x++) {
+      final n = hits[y * width + x];
+      if (n == 0) {
+        // Remember the widest remaining gap, preferring the horizon: a hole
+        // there is far more visible than one at the pole.
+        if (rowWeight > worstRowWeight) {
+          worstRowWeight = rowWeight;
+          worstLat = 90 - (y + 0.5) / height * 180;
+          worstLon = -180 + (x + 0.5) / width * 360;
+        }
+        continue;
+      }
+      singleArea += rowWeight;
+      if (n >= 2) doubleArea += rowWeight;
+      if (n >= 3) tripleArea += rowWeight;
+    }
+  }
+  final single = singleArea / totalArea;
+  final doubleCoverage = doubleArea / totalArea;
+  final tripleCoverage = tripleArea / totalArea;
+
+  if (single < 0.995) {
+    final lon = worstLon >= 0 ? '+${worstLon.round()}' : '${worstLon.round()}';
+    final lat = worstLat >= 0 ? '+${worstLat.round()}' : '${worstLat.round()}';
     return (
       ok: false,
       message:
-          'Only ${(covered / (width * height) * 100).round()}% of the sphere '
-          'was covered. The capture may be missing frames.',
+          'The sphere is only ${(single * 100).toStringAsFixed(1)}% covered, '
+          'so the panorama would have a hole. The largest gap is around '
+          'longitude $lon°, latitude $lat° — retake that direction. Every '
+          'saved photograph has been kept.',
     );
   }
 
@@ -335,89 +426,14 @@ class EquirectangularStitcher implements PanoramaStitcher {
       // Best effort; the JPEG is what matters.
     }
   }
-  return (ok: true, message: 'Panorama generated successfully.');
-}
-
-/// Longitude/latitude bounds of a frame's image rectangle, in radians.
-({double minLon, double maxLon, double minLat, double maxLat, double span})
-_lonLatBounds(
-  Quat cameraToSphere,
-  int width,
-  int height,
-  double focal,
-  double cx,
-  double cy,
-) {
-  var minLon = 10.0;
-  var maxLon = -10.0;
-  var minLat = 10.0;
-  var maxLat = -10.0;
-  // Sample the four edges, not just the corners: a projected rectangle bows
-  // outward, so corners alone can under-estimate the covered region.
-  for (var i = 0; i <= 8; i++) {
-    final t = i / 8;
-    final samples = <(double, double)>[
-      (t * (width - 1), 0),
-      (t * (width - 1), height - 1),
-      (0, t * (height - 1)),
-      (width - 1, t * (height - 1)),
-    ];
-    for (final (u, v) in samples) {
-      final cam = Vec3((u - cx) / focal, -(v - cy) / focal, -1).normalized;
-      final dir = cameraToSphere.rotate(cam);
-      final lon = math.atan2(dir.x, -dir.z);
-      final lat = math.asin(_clampDouble(dir.y, -1, 1));
-      if (lon < minLon) minLon = lon;
-      if (lon > maxLon) maxLon = lon;
-      if (lat < minLat) minLat = lat;
-      if (lat > maxLat) maxLat = lat;
-    }
-  }
-  // Unwrap around the frame centre so a frame near ±180° gets a contiguous
-  // range instead of a min/max spanning the whole circle.
-  final centreLon = math.atan2(
-    cameraToSphere.rotate(const Vec3(0, 0, -1)).x,
-    -cameraToSphere.rotate(const Vec3(0, 0, -1)).z,
-  );
-  minLon = _unwrap(minLon, centreLon);
-  maxLon = _unwrap(maxLon, centreLon);
-  if (maxLon - minLon > 3.141592653589793) {
-    // A frame that straddles the seam: treat it as full width.
-    return (
-      minLon: -3.141592653589793,
-      maxLon: 3.141592653589793,
-      minLat: minLat,
-      maxLat: maxLat,
-      span: 6.283185307179586,
-    );
-  }
-  const margin = 0.035;
   return (
-    minLon: minLon - margin,
-    maxLon: maxLon + margin,
-    minLat: _clampDouble(
-      minLat - margin,
-      -1.5707963267948966,
-      1.5707963267948966,
-    ),
-    maxLat: _clampDouble(
-      maxLat + margin,
-      -1.5707963267948966,
-      1.5707963267948966,
-    ),
-    span: maxLon - minLon,
+    ok: true,
+    message:
+        'Panorama generated. Coverage '
+        '${(single * 100).toStringAsFixed(1)}% single, '
+        '${(doubleCoverage * 100).toStringAsFixed(1)}% double, '
+        '${(tripleCoverage * 100).toStringAsFixed(1)}% triple.',
   );
-}
-
-double _unwrap(double angle, double centre) {
-  var value = angle;
-  while (value - centre > 3.141592653589793) {
-    value -= 6.283185307179586;
-  }
-  while (value - centre < -3.141592653589793) {
-    value += 6.283185307179586;
-  }
-  return value;
 }
 
 int _lerp4(int c00, int c10, int c01, int c11, double du, double dv) =>

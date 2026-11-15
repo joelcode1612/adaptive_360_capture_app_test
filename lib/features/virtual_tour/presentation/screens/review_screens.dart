@@ -89,6 +89,7 @@ class _StationReviewScreenState extends State<StationReviewScreen> {
     ).badFrameIndices.toSet();
 
     return FlowScaffold(
+      onLight: true,
       title: '${record.displayName} review',
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -104,7 +105,7 @@ class _StationReviewScreenState extends State<StationReviewScreen> {
               // `.sim` — the disclaimer badge, not the `.chip` status badge.
               ChipBadge(
                 label: 'Not stitched here',
-                color: CaptureColors.warn,
+                color: CaptureColors.warnOnLight,
                 outlined: true,
               ),
               ChipBadge(
@@ -114,9 +115,9 @@ class _StationReviewScreenState extends State<StationReviewScreen> {
                     ? 'Needs review'
                     : 'In progress',
                 color: accepted
-                    ? CaptureColors.ok
+                    ? CaptureColors.okOnLight
                     : needsReview
-                    ? CaptureColors.warn
+                    ? CaptureColors.warnOnLight
                     : null,
               ),
             ],
@@ -127,14 +128,14 @@ class _StationReviewScreenState extends State<StationReviewScreen> {
           Text(
             'Captured ${record.capturedCount} of ${record.total}'
             '${record.skippedCount > 0 ? ' · skipped ${record.skippedCount}' : ''}',
-            style: TextStyle(color: CaptureColors.mutedOnDark),
+            style: TextStyle(color: SiteWiseColors.muted),
           ),
           if (record.coveragePct != null) ...[
             const SizedBox(height: 6),
             Text(
               'Measured spherical coverage: '
               '${record.coveragePct!.toStringAsFixed(1)}%',
-              style: TextStyle(color: CaptureColors.mutedOnDark),
+              style: TextStyle(color: SiteWiseColors.muted),
             ),
             const SizedBox(height: 4),
             const ProvisionalLabel(
@@ -496,14 +497,14 @@ class _FrameGrid extends StatelessWidget {
             child: Container(
               decoration: BoxDecoration(
                 color: retake.contains(i)
-                    ? CaptureColors.warn
+                    ? CaptureColors.warnOnLight
                     : switch (sphereDotRole(record.statuses[i])) {
-                        SphereDotRole.ok => CaptureColors.ok,
-                        SphereDotRole.warn => CaptureColors.warn,
+                        SphereDotRole.ok => CaptureColors.okOnLight,
+                        SphereDotRole.warn => CaptureColors.warnOnLight,
                         SphereDotRole.neutral => CaptureColors.frameCellEmpty,
                       },
                 border: retake.contains(i)
-                    ? Border.all(color: CaptureColors.danger, width: 1.5)
+                    ? Border.all(color: CaptureColors.dangerOnLight, width: 1.5)
                     : null,
                 borderRadius: BorderRadius.circular(3),
               ),
@@ -529,6 +530,7 @@ class AddStationScreen extends StatelessWidget {
     final next = engine.stations.length + 1;
 
     return FlowScaffold(
+      onLight: true,
       title: 'Add station',
       onBack: () => controller.goTo(CaptureScreen.stationReview),
       body: Column(
@@ -592,7 +594,7 @@ class AddStationScreen extends StatelessWidget {
           Text(
             '${accepted.length} accepted · estimated total '
             '${engine.recommendation.estimate}',
-            style: TextStyle(color: CaptureColors.mutedOnDark),
+            style: TextStyle(color: SiteWiseColors.muted),
           ),
           const SizedBox(height: 6),
           const ProvisionalLabel(
@@ -665,6 +667,7 @@ class TourPreviewScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final accepted = engine.acceptedStations;
     return FlowScaffold(
+      onLight: true,
       title: 'Virtual tour preview',
       onBack: () => controller.goTo(CaptureScreen.addStation),
       body: Column(
@@ -694,7 +697,7 @@ class TourPreviewScreen extends StatelessWidget {
                   children: [
                     const Icon(
                       Icons.panorama,
-                      color: CaptureColors.ok,
+                      color: CaptureColors.okOnLight,
                       size: 20,
                     ),
                     const SizedBox(width: 10),
@@ -710,7 +713,7 @@ class TourPreviewScreen extends StatelessWidget {
                             '${s.savedFrames} frames'
                             '${s.coveragePct == null ? '' : ' · ${s.coveragePct!.toStringAsFixed(1)}% coverage'}',
                             style: const TextStyle(
-                              color: CaptureColors.mutedOnDark,
+                              color: SiteWiseColors.muted,
                               fontSize: 12,
                             ),
                           ),

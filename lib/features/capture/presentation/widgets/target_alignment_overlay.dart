@@ -96,41 +96,43 @@ class TargetAlignmentOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // The band is 80–120 dp, centred on the 96 dp reticle the aim point was
-    // authored at: a bare `shortestSide × 0.25` shrank the ring to 90 dp on a
-    // 360 dp phone, so 80 dp is the legibility floor, while 120 dp is the cap
-    // that keeps the ring from covering more of the preview than it has to.
-    // Stack alignment is `center`, so the ring stays on the optical axis at
-    // every size.
-    final reticleSize = (MediaQuery.sizeOf(context).shortestSide * 0.25).clamp(
-      80.0,
-      120.0,
-    );
+    // The ring is the aim reference, so its size is a legibility decision, not
+    // a decorative one: 0.34 of the short side puts a 390 dp phone at 133 dp and
+    // a 320 dp phone at 116 dp, clamped to the specification's 128–144 band.
+    // The previous 80–120 dp band read as a small badge over a busy camera
+    // image, which is exactly the "difficult to locate" complaint.
+    //
+    // This is display-only. No tolerance, projection or capture gate reads it;
+    // the ring is drawn on the optical axis and the shutter still fires from
+    // `CaptureState.captureBlockReason`.
+    final reticleSize = CaptureMetrics.reticleFor(MediaQuery.sizeOf(context));
     return IgnorePointer(
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          BezelReticle(
-            size: reticleSize,
-            progress: withinTolerance ? stabilityProgress : 0,
-            withinTolerance: withinTolerance,
-            completed: completed,
-            holdComplete: holdComplete,
-            captureBlocked: captureBlocked,
-            bezel: bezel,
-          ),
-          CustomPaint(
-            painter: _ArrowPainter(
-              alignment: alignment,
-              anchored: anchored,
-              poseValid: poseValid,
-              displayFov: displayFov,
-              displayProjectionMatrix: displayProjectionMatrix,
-              reticleSize: reticleSize,
+      child: ExcludeSemantics(
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            BezelReticle(
+              size: reticleSize,
+              progress: withinTolerance ? stabilityProgress : 0,
+              withinTolerance: withinTolerance,
+              completed: completed,
+              holdComplete: holdComplete,
+              captureBlocked: captureBlocked,
+              bezel: bezel,
             ),
-            child: const SizedBox.expand(),
-          ),
-        ],
+            CustomPaint(
+              painter: _ArrowPainter(
+                alignment: alignment,
+                anchored: anchored,
+                poseValid: poseValid,
+                displayFov: displayFov,
+                displayProjectionMatrix: displayProjectionMatrix,
+                reticleSize: reticleSize,
+              ),
+              child: const SizedBox.expand(),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -7,6 +7,7 @@ import 'package:adaptive_360_capture_app/features/capture/data/repositories/capt
 import 'package:adaptive_360_capture_app/features/capture/data/services/ar_session_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/photo_capture_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/plane_anchor_service.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/stitch/incremental_stitch_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/motion/shot_phase.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
@@ -33,6 +34,7 @@ class CaptureModuleScreen extends StatefulWidget {
     this.repository,
     this.stationId,
     this.onComplete,
+    this.stitchService,
   });
 
   final CaptureGeometryConfig geometry;
@@ -50,6 +52,11 @@ class CaptureModuleScreen extends StatefulWidget {
 
   /// Called once when all 26 targets have a saved photograph.
   final VoidCallback? onComplete;
+
+  /// The incremental stitching verifier, when the host flow screen provides
+  /// one. Passed straight to the controller; `null` leaves capture behaviour
+  /// unchanged.
+  final IncrementalStitchService? stitchService;
 
   @override
   State<CaptureModuleScreen> createState() => _CaptureModuleScreenState();
@@ -94,6 +101,7 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
         repository: repository,
         geometry: widget.geometry,
         defaultStationId: widget.stationId,
+        incrementalStitch: widget.stitchService,
       );
       if (!mounted) {
         controller.dispose();
@@ -217,9 +225,12 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
         }
         final controller = _controller;
         if (controller == null) {
-          return const Scaffold(
-            backgroundColor: Colors.black,
-            body: Center(child: CircularProgressIndicator()),
+          return Theme(
+            data: captureCameraTheme(),
+            child: const Scaffold(
+              backgroundColor: Colors.black,
+              body: Center(child: CircularProgressIndicator()),
+            ),
           );
         }
         return _CaptureBody(controller: controller);
@@ -235,36 +246,39 @@ class _Failure extends StatelessWidget {
   final String message;
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: CaptureColors.cameraChrome,
-    body: SafeArea(
-      child: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.view_in_ar_outlined,
-                size: 48,
-                color: Colors.white70,
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                'AR capture could not start',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
+  Widget build(BuildContext context) => Theme(
+    data: captureAppTheme(),
+    child: Scaffold(
+      backgroundColor: CaptureColors.cameraChrome,
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.view_in_ar_outlined,
+                  size: 48,
+                  color: Colors.white70,
                 ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: CaptureColors.mutedOnDark),
-              ),
-            ],
+                const SizedBox(height: 16),
+                const Text(
+                  'The camera could not start',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: CaptureColors.mutedOnDark),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -294,108 +308,113 @@ class _CaptureBody extends StatelessWidget {
       // back gesture must leave it. Every saved frame is already on disk and the
       // tour stays a draft, which is what "Resume Previous Capture" restores.
       canPop: true,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            // ── the AR camera scene ──────────────────────────────────────
-            if (textureId != null && textureId >= 0)
-              Texture(textureId: textureId, filterQuality: FilterQuality.none)
-            else
-              const ColoredBox(color: Colors.black),
+      child: Theme(
+        // The camera screen keeps the dark scheme whatever the app's default is.
+        data: captureCameraTheme(),
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: Stack(
+            fit: StackFit.expand,
+            children: [
+              // ── the AR camera scene ──────────────────────────────────────
+              if (textureId != null && textureId >= 0)
+                Texture(textureId: textureId, filterQuality: FilterQuality.none)
+              else
+                const ColoredBox(color: Colors.black),
 
-            // Keep the physical aim ring on screen for the whole calibrated
-            // station. After a successful shot the controller deliberately
-            // clears the active target (so its arrow cannot point at a saved
-            // node), but removing the ring made that safe transition look like
-            // an AR failure. With no target the painter draws only this neutral
-            // reticle; the status line says “Select a target”.
-            if (state.station != null && state.phase == CapturePhase.capturing)
-              TargetAlignmentOverlay(
-                // One alignment for the arrow, the ring and the shutter. It was
-                // `displayAlignment` here — a filtered copy of the same pose —
-                // so the pointer lagged the arithmetic it was meant to picture.
-                alignment: state.alignment,
-                withinTolerance: state.alignment?.withinTolerance ?? false,
-                // The controller/VIO engine owns the only hold calculation.
-                // Do not show it through an unmet prerequisite; once that same
-                // genuine hold arms a shutter, keep its 100% green confirmation
-                // visible while the real JPEG is being saved.
-                stabilityProgress: holdComplete
-                    ? 1
-                    : state.displayCaptureBlockReasonBeforeSettle == null
-                    ? state.stabilityProgress
-                    : 0,
-                // A blocked, aligned target is amber so the operator can see
-                // that alignment is not sufficient. Misalignment stays neutral;
-                // tracking loss clears alignment and suspends the sweep.
-                captureBlocked:
-                    state.guidanceTarget != null &&
-                    !holdComplete &&
-                    (state.alignment?.withinTolerance ?? false) &&
-                    state.displayCaptureBlockReasonBeforeSettle != null,
-                holdComplete: holdComplete,
-                // A paused anchor is now hidden rather than drawn from its
-                // stale pose, so the overlay must remain neutral too. The
-                // marker and its guidance therefore always appear and disappear
-                // together.
-                anchored: state.activeAnchored && state.activeAnchorTracking,
-                // What the arrow *cannot* work without is a camera pose: its
-                // direction is the projection of the target through that pose.
-                // When AR is not tracking, no arrow — the instruction line
-                // carries the tracking state instead.
-                // During tracking recovery the camera has a pose again, but
-                // it has not yet been proven continuous with the frozen
-                // station. Keep the reticle neutral until that check passes.
-                poseValid:
-                    state.tracking == TrackingState.tracking &&
-                    !state.trackingRecovering,
-                // The arrow projects the target with the same field of view the
-                // session reported, falling back to it only when the renderer
-                // could not provide its display-geometry-aware projection.
-                displayFov: state.displayFov,
-                displayProjectionMatrix: state.displayProjectionMatrix,
-                // The ring *is* the shipped bezel, so the reticle and the marker
-                // on the wall are the same shape.
-                bezel: controller.bezelGeometry,
-                completed: state.shotPhase == ShotPhase.accept,
-              ),
+              // Keep the physical aim ring on screen for the whole calibrated
+              // station. After a successful shot the controller deliberately
+              // clears the active target (so its arrow cannot point at a saved
+              // node), but removing the ring made that safe transition look like
+              // an AR failure. With no target the painter draws only this neutral
+              // reticle; the status line says “Select a target”.
+              if (state.station != null &&
+                  state.phase == CapturePhase.capturing)
+                TargetAlignmentOverlay(
+                  // One alignment for the arrow, the ring and the shutter. It was
+                  // `displayAlignment` here — a filtered copy of the same pose —
+                  // so the pointer lagged the arithmetic it was meant to picture.
+                  alignment: state.alignment,
+                  withinTolerance: state.alignment?.withinTolerance ?? false,
+                  // The controller/VIO engine owns the only hold calculation.
+                  // Do not show it through an unmet prerequisite; once that same
+                  // genuine hold arms a shutter, keep its 100% green confirmation
+                  // visible while the real JPEG is being saved.
+                  stabilityProgress: holdComplete
+                      ? 1
+                      : state.displayCaptureBlockReasonBeforeSettle == null
+                      ? state.stabilityProgress
+                      : 0,
+                  // A blocked, aligned target is amber so the operator can see
+                  // that alignment is not sufficient. Misalignment stays neutral;
+                  // tracking loss clears alignment and suspends the sweep.
+                  captureBlocked:
+                      state.guidanceTarget != null &&
+                      !holdComplete &&
+                      (state.alignment?.withinTolerance ?? false) &&
+                      state.displayCaptureBlockReasonBeforeSettle != null,
+                  holdComplete: holdComplete,
+                  // A paused anchor is now hidden rather than drawn from its
+                  // stale pose, so the overlay must remain neutral too. The
+                  // marker and its guidance therefore always appear and disappear
+                  // together.
+                  anchored: state.activeAnchored && state.activeAnchorTracking,
+                  // What the arrow *cannot* work without is a camera pose: its
+                  // direction is the projection of the target through that pose.
+                  // When AR is not tracking, no arrow — the instruction line
+                  // carries the tracking state instead.
+                  // During tracking recovery the camera has a pose again, but
+                  // it has not yet been proven continuous with the frozen
+                  // station. Keep the reticle neutral until that check passes.
+                  poseValid:
+                      state.tracking == TrackingState.tracking &&
+                      !state.trackingRecovering,
+                  // The arrow projects the target with the same field of view the
+                  // session reported, falling back to it only when the renderer
+                  // could not provide its display-geometry-aware projection.
+                  displayFov: state.displayFov,
+                  displayProjectionMatrix: state.displayProjectionMatrix,
+                  // The ring *is* the shipped bezel, so the reticle and the marker
+                  // on the wall are the same shape.
+                  bezel: controller.bezelGeometry,
+                  completed: state.shotPhase == ShotPhase.accept,
+                ),
 
-            // A native render failure is not a hint, it is the reason the
-            // preview is black — so it takes the whole top band, states the
-            // exception, and offers the one action that can fix it.
-            if (state.arFault != null)
+              // A native render failure is not a hint, it is the reason the
+              // preview is black — so it takes the whole top band, states the
+              // exception, and offers the one action that can fix it.
+              if (state.arFault != null)
+                Positioned(
+                  left: 12,
+                  right: 12,
+                  top: MediaQuery.paddingOf(context).top + 8,
+                  child: _FaultBanner(
+                    message: state.arFault!,
+                    frame: state.arFaultFrame,
+                    onRetry: controller.retrySession,
+                  ),
+                )
+              else
+                // One line of status, expandable. Tracking and the shared
+                // station-reference state are the live capture prerequisites.
+                _StatusBar(
+                  controller: controller,
+                  top: MediaQuery.paddingOf(context).top + 8,
+                  right: 108,
+                ),
+
               Positioned(
-                left: 12,
                 right: 12,
                 top: MediaQuery.paddingOf(context).top + 8,
-                child: _FaultBanner(
-                  message: state.arFault!,
-                  frame: state.arFaultFrame,
-                  onRetry: controller.retrySession,
-                ),
-              )
-            else
-              // One line of status, expandable. Tracking and the shared
-              // station-reference state are the live capture prerequisites.
-              _StatusBar(
-                controller: controller,
-                top: MediaQuery.paddingOf(context).top + 8,
-                right: 108,
+                child: _MiniMapButton(controller: controller),
               ),
 
-            Positioned(
-              right: 12,
-              top: MediaQuery.paddingOf(context).top + 8,
-              child: _MiniMapButton(controller: controller),
-            ),
-
-            Align(
-              alignment: Alignment.bottomCenter,
-              child: _ControlPanel(controller: controller),
-            ),
-          ],
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: _ControlPanel(controller: controller),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -502,23 +521,32 @@ class _MiniMapButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = controller.state;
-    return SizedBox.square(
-      dimension: CaptureMetrics.miniMapSize,
-      child: FilledButton(
-        style: FilledButton.styleFrom(
-          backgroundColor: CaptureColors.cameraChrome.withValues(alpha: 0.72),
-          padding: const EdgeInsets.all(5),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(CaptureMetrics.miniMapRadius),
+    return Semantics(
+      button: true,
+      label:
+          'Capture progress: ${state.capturedCount} of '
+          '${state.totalTargets} photographs saved. Open the target list',
+      child: SizedBox.square(
+        dimension: CaptureMetrics.miniMapSize,
+        child: FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: CaptureColors.chromeOverlay(0.82),
+            padding: const EdgeInsets.all(5),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(CaptureMetrics.miniMapRadius),
+              side: const BorderSide(color: CaptureColors.hairlineChip),
+            ),
           ),
-        ),
-        onPressed: () => _openTargetSheet(context, controller),
-        child: SphericalTargetMap(
-          specs: controller.specs,
-          targets: state.targets,
-          activeTargetId: state.activeTargetId,
-          onSelect: (_) {},
-          size: CaptureMetrics.miniMapSize - 10,
+          onPressed: () => _openTargetSheet(context, controller),
+          child: ExcludeSemantics(
+            child: SphericalTargetMap(
+              specs: controller.specs,
+              targets: state.targets,
+              activeTargetId: state.activeTargetId,
+              onSelect: (_) {},
+              size: CaptureMetrics.miniMapSize - 10,
+            ),
+          ),
         ),
       ),
     );
@@ -581,7 +609,7 @@ class _TargetSheet extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Text(
-                'Capture targets',
+                'Photo targets',
                 style: TextStyle(
                   color: Colors.white,
                   fontSize: 16,
@@ -626,10 +654,10 @@ class _TargetSheet extends StatelessWidget {
                 const SizedBox(height: 8),
                 Text(
                   !referenceAvailable
-                      ? 'The world reference needs verified re-establishment. '
-                            'Saved photographs and target IDs are retained.'
+                      ? 'Camera tracking needs to be restored. Saved photographs and '
+                            'target numbers are kept.'
                       : state.trackingRecovering
-                      ? 'Verifying the shared station anchor and fresh camera pose.'
+                      ? 'Checking that the camera can see the room again…'
                       : 'Targets use the station-local geometry and one shared world anchor.'
                             '${state.anchorCount == null ? '' : ' Native anchor count: ${state.anchorCount}.'}',
                   style: const TextStyle(
@@ -744,6 +772,26 @@ class _ControlPanelState extends State<_ControlPanel> {
               letterSpacing: 0.2,
             ),
           ),
+          // The hold, where the user is looking for it: under the instruction
+          // that says "hold steady". It only appears once the aim is actually
+          // inside tolerance, because a bar that fills while the target is off
+          // centre would be progress towards nothing.
+          if (state.alignment?.withinTolerance == true) ...[
+            const SizedBox(height: 7),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: state.stabilityProgress.clamp(0.0, 1.0),
+                minHeight: 6,
+                backgroundColor: CaptureColors.trackOnDark,
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  state.readyToCapture
+                      ? CaptureColors.ok
+                      : CaptureColors.primary,
+                ),
+              ),
+            ),
+          ],
           if (state.movementWarning case final warning?) ...[
             const SizedBox(height: 4),
             Text(
@@ -783,7 +831,7 @@ class _ControlPanelState extends State<_ControlPanel> {
           const SizedBox(height: 10),
           if (state.station == null) ...[
             _PrimaryButton(
-              label: 'Calibrate station',
+              label: 'Set your standing position',
               enabled: calibrationReadiness.isReady,
               onPressed: () => controller.calibrateStation(),
             ),
@@ -808,8 +856,8 @@ class _ControlPanelState extends State<_ControlPanel> {
               const SizedBox(height: 8),
               _GhostButton(
                 label: controller.resumeKeepsWorldFrame
-                    ? 'Resume last capture'
-                    : 'Recalibrate & continue',
+                    ? 'Continue saved capture'
+                    : 'Restore tracking & continue',
                 // Both actions ultimately record/reuse a camera pose.  Use
                 // the same controller-owned validation as the primary
                 // calibration button so recovery cannot offer an enabled
@@ -820,9 +868,9 @@ class _ControlPanelState extends State<_ControlPanel> {
             ],
           ] else if (controller.requiresReferenceReestablishment) ...[
             const Text(
-              'The AR world reference was lost. The station, target IDs and '
-              'accepted photographs are retained; continue only after a fresh '
-              'tracked camera pose creates a new shared reference.',
+              'Camera tracking was lost. Your saved photographs and target '
+              'numbers are kept. Point the phone at the room until tracking '
+              'comes back, then continue.',
               style: TextStyle(
                 color: CaptureColors.warn,
                 fontSize: 12,
@@ -831,7 +879,7 @@ class _ControlPanelState extends State<_ControlPanel> {
             ),
             const SizedBox(height: 8),
             _GhostButton(
-              label: 'Re-establish reference & continue',
+              label: 'Restore camera tracking',
               enabled: calibrationReadiness.isReady,
               onPressed: () =>
                   controller.recalibrateAndContinue(state.station!.stationId),
@@ -880,8 +928,9 @@ class _ControlPanelState extends State<_ControlPanel> {
             const SizedBox(height: 6),
             Text(
               reason,
-              maxLines: _expanded ? 3 : 1,
-              overflow: TextOverflow.ellipsis,
+              // Two lines even collapsed: a warning truncated to
+              // "Move the phone…" is a warning the user cannot act on.
+              maxLines: _expanded ? 3 : 2,
               style: const TextStyle(
                 color: CaptureColors.warn,
                 fontSize: 11,
@@ -987,7 +1036,11 @@ class _StatusBarState extends State<_StatusBar> {
                   ],
                 ),
                 AnimatedSize(
-                  duration: const Duration(milliseconds: 160),
+                  // A user who has asked the system for reduced motion gets the
+                  // detail instantly rather than sliding open.
+                  duration: MediaQuery.disableAnimationsOf(context)
+                      ? Duration.zero
+                      : const Duration(milliseconds: 160),
                   curve: Curves.easeOutCubic,
                   alignment: Alignment.topCenter,
                   child: _expanded
@@ -1058,23 +1111,24 @@ Color _statusColor(CaptureState state) {
 /// The one line shown when the status bar is collapsed. It names actual
 /// tracking/reference state and never reports plane counts as capture readiness.
 String _statusLine(CaptureState state, {bool referenceLost = false}) {
-  final tracking = state.tracking == TrackingState.tracking
-      ? 'AR tracking OK'
-      : _trackingLabel(state.tracking);
-  final reference = referenceLost
-      ? 'world reference lost'
-      : state.station == null
-      ? 'station reference needed'
-      : state.trackingRecovering
-      ? 'verifying station reference'
-      : state.activeAnchored && state.activeAnchorTracking
-      ? 'shared anchor tracked'
-      : state.activeAnchored
-      ? 'shared anchor paused'
-      : 'station calibrated';
-  final rotation = state.rotatingInPlace ? ' · body rotation' : '';
-  return '$tracking · $reference · '
-      '${state.capturedCount}/${state.totalTargets}$rotation';
+  // One sentence a first-time user can act on. "shared anchor tracked" is a
+  // fact about ARCore's graph, not about what the person holding the phone
+  // should do next, so it lives in the expandable detail instead.
+  final count = '${state.capturedCount} of ${state.totalTargets} photos saved';
+  if (referenceLost) return 'Camera tracking lost · $count';
+  if (state.station == null) {
+    return state.tracking == TrackingState.tracking
+        ? 'Camera ready · set your standing position'
+        : '${_trackingLabel(state.tracking)} · $count';
+  }
+  if (state.trackingRecovering) return 'Checking camera tracking… · $count';
+  if (state.tracking != TrackingState.tracking) {
+    return '${_trackingLabel(state.tracking)} · $count';
+  }
+  if (!state.activeAnchored || !state.activeAnchorTracking) {
+    return 'Marker paused · move the phone slowly · $count';
+  }
+  return 'Tracking · $count';
 }
 
 String _signed(double v) => '${v >= 0 ? '+' : ''}${v.toStringAsFixed(1)}';
@@ -1103,11 +1157,11 @@ String? _trackingAdvice(CaptureState state) {
 
 /// `tracking` on its own reads as a stutter in "Tracking tracking".
 String _trackingLabel(TrackingState tracking) => switch (tracking) {
-  TrackingState.tracking => 'AR tracking OK',
-  TrackingState.initialising => 'AR starting',
-  TrackingState.paused => 'AR tracking paused',
-  TrackingState.stopped => 'AR tracking stopped',
-  TrackingState.unavailable => 'AR unavailable',
+  TrackingState.tracking => 'Tracking',
+  TrackingState.initialising => 'Starting camera',
+  TrackingState.paused => 'Tracking paused',
+  TrackingState.stopped => 'Tracking stopped',
+  TrackingState.unavailable => 'AR not available',
 };
 
 String _detailText(CaptureState state, {bool referenceLost = false}) {
@@ -1243,23 +1297,28 @@ class _CollapseHandle extends StatelessWidget {
     label: label,
     child: InkWell(
       onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
+      // A 48 dp tall target for a control that only looks like a 3 dp handle:
+      // the visible bar stays small so it does not compete with the shutter,
+      // but the touch area is the accessibility minimum.
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(
+          minHeight: CaptureMetrics.minTouchTarget,
+        ),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Container(
-              width: 34,
-              height: 3,
+              width: 40,
+              height: 4,
               decoration: BoxDecoration(
-                color: CaptureColors.mutedOnDark.withValues(alpha: 0.6),
+                color: CaptureColors.mutedOnDark.withValues(alpha: 0.7),
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
             const SizedBox(width: 6),
             Icon(
               expanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up,
-              size: 16,
+              size: 18,
               color: CaptureColors.mutedOnDark,
             ),
           ],
@@ -1291,82 +1350,90 @@ class _TargetRow extends StatelessWidget {
       referenceAvailable: referenceAvailable,
     );
     final (label, color) = _appearance(verdict);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 30,
-            child: Text(
-              '${target.targetId}',
-              style: const TextStyle(
-                color: CaptureColors.mutedOnDark,
-                fontSize: 12,
-                fontFeatures: [FontFeature.tabularFigures()],
-              ),
-            ),
-          ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'yaw ${target.yawDegrees.toStringAsFixed(0)}° · '
-                  'pitch ${target.pitchDegrees.toStringAsFixed(0)}°'
-                  '${target.isZenith ? ' · zenith' : ''}'
-                  '${target.isNadir ? ' · nadir' : ''}',
-                  style: const TextStyle(color: Colors.white, fontSize: 12),
+    final readable = label.toLowerCase();
+    return Semantics(
+      // "Target 9, not captured" — the row's own words, not its numbers.
+      label: 'Target ${target.targetId}, $readable',
+      button: onRetake != null,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            SizedBox(
+              width: 32,
+              child: Text(
+                '${target.targetId}',
+                style: const TextStyle(
+                  color: CaptureColors.mutedOnDark,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  fontFeatures: [FontFeature.tabularFigures()],
                 ),
-                if (detail != null)
-                  Text(
-                    detail,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: CaptureColors.mutedOnDark,
-                      fontSize: 10,
-                      height: 1.3,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.16),
-              borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-              border: Border.all(color: color.withValues(alpha: 0.5)),
-            ),
-            child: Text(
-              label,
-              style: TextStyle(
-                color: color,
-                fontSize: 10,
-                fontWeight: FontWeight.w600,
               ),
             ),
-          ),
-          if (onRetake != null) ...[
-            const SizedBox(width: 2),
-            TextButton(
-              onPressed: onRetake,
-              style: TextButton.styleFrom(
-                foregroundColor: CaptureColors.accent,
-                minimumSize: Size.zero,
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                textStyle: const TextStyle(
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'yaw ${target.yawDegrees.toStringAsFixed(0)}° · '
+                    'pitch ${target.pitchDegrees.toStringAsFixed(0)}°'
+                    '${target.isZenith ? ' · zenith' : ''}'
+                    '${target.isNadir ? ' · nadir' : ''}',
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                  ),
+                  if (detail != null)
+                    Text(
+                      detail,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: CaptureColors.mutedOnDark,
+                        fontSize: 12,
+                        height: 1.3,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.16),
+                borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
+                border: Border.all(color: color.withValues(alpha: 0.5)),
+              ),
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: color,
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
                 ),
               ),
-              child: const Text('Retake'),
             ),
+            if (onRetake != null) ...[
+              const SizedBox(width: 2),
+              TextButton(
+                onPressed: onRetake,
+                style: TextButton.styleFrom(
+                  foregroundColor: CaptureColors.accentOnDark,
+                  // The padded tap target is the point: the label stays small,
+                  // the hit area does not.
+                  minimumSize: const Size(64, CaptureMetrics.minTouchTarget),
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  textStyle: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                child: const Text('Retake'),
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
@@ -1378,8 +1445,8 @@ class _TargetRow extends StatelessWidget {
         TargetVerdict.saved => ('Saved', CaptureColors.ok),
         TargetVerdict.failed => ('Failed', CaptureColors.danger),
         TargetVerdict.referenceLost => ('Needs reference', CaptureColors.warn),
-        TargetVerdict.ready => ('Placed', CaptureColors.accent),
-        TargetVerdict.active => ('Active', CaptureColors.accent),
+        TargetVerdict.ready => ('Placed', CaptureColors.accentOnDark),
+        TargetVerdict.active => ('Active', CaptureColors.accentOnDark),
       };
 }
 
@@ -1403,25 +1470,25 @@ class _PhaseChip extends StatelessWidget {
         ? CaptureColors.warn
         : switch (phase) {
             ShotPhase.capture || ShotPhase.accept => CaptureColors.ok,
-            ShotPhase.validate => CaptureColors.accent,
+            ShotPhase.validate => CaptureColors.accentOnDark,
             ShotPhase.retry => CaptureColors.danger,
             ShotPhase.settle => CaptureColors.warn,
             ShotPhase.align => CaptureColors.warn,
             ShotPhase.initialising => CaptureColors.pendingDot,
           };
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.16),
-        borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-        border: Border.all(color: color.withValues(alpha: 0.55)),
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(100),
+        border: Border.all(color: color.withValues(alpha: 0.45)),
       ),
       child: Text(
         stationDriftWarningActive ? 'Return to station' : phase.label,
         style: TextStyle(
           color: color,
-          fontSize: 10,
-          fontWeight: FontWeight.w600,
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
           letterSpacing: 0.2,
         ),
       ),
@@ -1446,7 +1513,7 @@ class _PrimaryButton extends StatelessWidget {
     style: FilledButton.styleFrom(
       backgroundColor: CaptureColors.accent,
       disabledBackgroundColor: CaptureColors.trackOnDark,
-      minimumSize: const Size.fromHeight(CaptureMetrics.buttonHeight),
+      minimumSize: const Size.fromHeight(CaptureMetrics.primaryButtonHeight),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
       ),
@@ -1477,7 +1544,7 @@ class _GhostButton extends StatelessWidget {
             ? CaptureColors.ghostButtonBorder
             : CaptureColors.ghostButtonBorderDisabled,
       ),
-      minimumSize: const Size.fromHeight(CaptureMetrics.buttonHeight),
+      minimumSize: const Size.fromHeight(CaptureMetrics.primaryButtonHeight),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
       ),

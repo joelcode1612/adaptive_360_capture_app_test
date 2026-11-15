@@ -16,6 +16,7 @@ import 'package:adaptive_360_capture_app/features/capture/data/services/ar_sessi
 import 'package:adaptive_360_capture_app/features/capture/data/services/glb_mesh_source.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/photo_capture_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/plane_anchor_service.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/stitch/incremental_stitch_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_station.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_record.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
@@ -198,6 +199,13 @@ class CaptureController extends ChangeNotifier {
     /// [calibrateStation]. SiteWise sets this to the tour id, so a tour owns
     /// exactly one calibrated station and resume can find it by id.
     this.defaultStationId,
+
+    /// The incremental stitching verifier, when the host screen provides one.
+    /// Called once per successful save — strictly *after* the JPEG is on disk
+    /// and recorded — and never on the failure paths, so a stitching problem
+    /// can never disturb capture state. May be null (tests, review-only
+    /// controllers); the capture flow works identically without it.
+    this.incrementalStitch,
   }) : _session = session,
        _anchors = anchors,
        _photos = photos,
@@ -239,6 +247,10 @@ class CaptureController extends ChangeNotifier {
   final PhotoCaptureService _photos;
   final CaptureRepository _repository;
   final DateTime Function() _clock;
+
+  /// The incremental stitching verifier, or `null`. Owned by the host screen;
+  /// the controller only notifies it, after the photograph is persisted.
+  final IncrementalStitchService? incrementalStitch;
 
   /// The frozen station reference and the 26 world-locked targets, plus the
   /// live gate.
@@ -2503,6 +2515,16 @@ class CaptureController extends ChangeNotifier {
       // The resume list must reflect what is on disk *now*: the next boot
       // offers "continue" from this station with this count.
       _savedStationIds = await _repository.stationIds();
+
+      // Incremental stitching verification. The photograph is persisted and
+      // verified at this point, which is the contract the service requires.
+      // Fire-and-forget and completely detached from capture state: the
+      // service runs its own background isolate and a stitching failure
+      // never feeds back into the target rows or the shutter.
+      final stitcher = incrementalStitch;
+      if (stitcher != null) {
+        unawaited(stitcher.onCaptureSaved(record));
+      }
 
       // The user may have chosen another target while the JPEG was being
       // written. The photograph still belongs to the target that was shot,

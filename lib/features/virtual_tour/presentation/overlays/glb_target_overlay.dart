@@ -528,7 +528,11 @@ class _FlatTargetMarker extends StatelessWidget {
 
   final ArTargetRenderState state;
 
-  static const double size = 102;
+  /// 132 dp — the aiming reticle's diameter, so the stand-in marker and the
+  /// ring the user aims with are the same size. It was 102 dp, which made a
+  /// degraded frame look like a different (smaller) target rather than the same
+  /// one.
+  static const double size = 132;
 
   @override
   Widget build(BuildContext context) {
@@ -557,13 +561,23 @@ class _FlatMarkerPainter extends CustomPainter {
     final c = Offset(size.width / 2, size.height / 2);
     final r = size.width / 2 - 2;
     canvas.drawCircle(c, r, Paint()..color = color.withValues(alpha: 0.18));
+    // A dark outline behind the state ring, so a pale marker on a pale wall is
+    // still a marker rather than a smudge.
+    canvas.drawCircle(
+      c,
+      r,
+      Paint()
+        ..color = Colors.black.withValues(alpha: 0.5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 6,
+    );
     canvas.drawCircle(
       c,
       r,
       Paint()
         ..color = color
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 3,
+        ..strokeWidth = 3.5,
     );
     canvas.drawCircle(
       c,

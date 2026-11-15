@@ -37,6 +37,7 @@ class FlowScaffold extends StatelessWidget {
     this.trailing,
     this.footer,
     this.onBack,
+    this.onLight = false,
   });
 
   /// Omit it for a screen the reference gives no header — `V[1]` is the only
@@ -50,39 +51,64 @@ class FlowScaffold extends StatelessWidget {
   final Widget? footer;
   final VoidCallback? onBack;
 
+  /// Whether this screen is one of the reference's **white** screens.
+  ///
+  /// The design reference puts the introduction, the plan, progress and review
+  /// on white paper with ink text, and keeps only the camera stages dark. This
+  /// flag is that distinction, so a screen opts in rather than each one
+  /// re-deriving a background and a text colour.
+  final bool onLight;
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: CaptureColors.cameraChrome,
-    body: SafeArea(
-      child: Column(
-        children: [
-          if (title != null || onBack != null)
-            FlowHeader(title: title ?? '', trailing: trailing, onBack: onBack),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(18, 6, 18, 12),
-              child: DefaultTextStyle.merge(
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  height: 1.45,
+  Widget build(BuildContext context) {
+    final background = onLight
+        ? SiteWiseColors.surface
+        : CaptureColors.cameraChrome;
+    final textStyle = onLight
+        ? const TextStyle(
+            color: SiteWiseColors.slate,
+            fontSize: 14,
+            height: 1.45,
+          )
+        : const TextStyle(color: Colors.white, fontSize: 14, height: 1.45);
+    return Theme(
+      // Material's own defaults have to follow, or a `TextButton` or a divider
+      // inside a light screen keeps the dark theme's ink.
+      data: onLight ? captureLightTheme() : captureAppTheme(),
+      child: Scaffold(
+        backgroundColor: background,
+        body: SafeArea(
+          child: Column(
+            children: [
+              if (title != null || onBack != null)
+                FlowHeader(
+                  title: title ?? '',
+                  trailing: trailing,
+                  onBack: onBack,
+                  onLight: onLight,
                 ),
-                child: body,
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(18, 6, 18, 12),
+                  child: DefaultTextStyle.merge(style: textStyle, child: body),
+                ),
               ),
-            ),
+              if (footer != null)
+                Container(
+                  width: double.infinity,
+                  color: onLight ? SiteWiseColors.surface : null,
+                  padding: const EdgeInsets.fromLTRB(18, 10, 18, 18),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [footer!],
+                  ),
+                ),
+            ],
           ),
-          if (footer != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(18, 10, 18, 18),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [footer!],
-              ),
-            ),
-        ],
+        ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 /// The prototype's `.hd`: a 52 dp row holding a round back button, the title,
@@ -96,63 +122,92 @@ class FlowHeader extends StatelessWidget {
     required this.title,
     this.trailing,
     this.onBack,
+    this.onLight = false,
   });
 
   final String title;
   final Widget? trailing;
   final VoidCallback? onBack;
 
+  /// White header with ink text and a bordered back button, as the reference's
+  /// `.head` on a light screen.
+  final bool onLight;
+
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: CaptureMetrics.headerHeight,
-    child: Padding(
-      // `.hd{padding:8px 14px 0}` — the 8 dp is above the text, not around it,
-      // so the title sits on the header's bottom edge and the body starts
-      // immediately under it.
-      padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
-      child: Row(
-        children: [
-          if (onBack != null) ...[
-            _HeaderBackButton(onPressed: onBack!),
-            const SizedBox(width: 8),
-          ],
-          Expanded(
-            child: Text(
-              title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
+  Widget build(BuildContext context) => Container(
+    decoration: onLight
+        ? const BoxDecoration(
+            color: SiteWiseColors.surface,
+            border: Border(bottom: BorderSide(color: SiteWiseColors.border)),
+          )
+        : null,
+    child: SizedBox(
+      height: CaptureMetrics.headerHeight,
+      child: Padding(
+        // `.hd{padding:8px 14px 0}` — the 8 dp is above the text, not around
+        // it, so the title sits on the header's bottom edge and the body starts
+        // immediately under it.
+        padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+        child: Row(
+          children: [
+            if (onBack != null) ...[
+              _HeaderBackButton(onPressed: onBack!, onLight: onLight),
+              const SizedBox(width: 8),
+            ],
+            Expanded(
+              child: Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: onLight ? SiteWiseColors.ink : Colors.white,
+                  // 16 dp, not 15: this is the only title on a capture screen.
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
-          ),
-          ?trailing,
-        ],
+            ?trailing,
+          ],
+        ),
       ),
     ),
   );
 }
 
-/// The prototype's `.ib` — a 32 dp circle of translucent white with a chevron in
-/// it, used only for the header's back action.
+/// The prototype's `.ib` — a round back button.
+///
+/// The reference draws it at 45 dp; this floors it at the 48 dp minimum touch
+/// target, because the header's back action is the one control a user reaches
+/// for while walking and holding a phone in the other hand.
 class _HeaderBackButton extends StatelessWidget {
-  const _HeaderBackButton({required this.onPressed});
+  const _HeaderBackButton({required this.onPressed, this.onLight = false});
 
   final VoidCallback onPressed;
+  final bool onLight;
 
   @override
-  Widget build(BuildContext context) => SizedBox.square(
-    dimension: CaptureMetrics.headerIconSize,
-    child: IconButton(
-      onPressed: onPressed,
-      tooltip: 'Back',
-      icon: const Icon(Icons.chevron_left, size: 20, color: Colors.white),
-      style: IconButton.styleFrom(
-        backgroundColor: CaptureColors.surface(0.12),
-        padding: EdgeInsets.zero,
-        shape: const CircleBorder(),
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    label: 'Back',
+    child: SizedBox.square(
+      dimension: CaptureMetrics.minTouchTarget,
+      child: IconButton(
+        onPressed: onPressed,
+        tooltip: 'Back',
+        icon: Icon(
+          Icons.chevron_left,
+          size: 24,
+          color: onLight ? SiteWiseColors.ink : Colors.white,
+        ),
+        style: IconButton.styleFrom(
+          backgroundColor: onLight
+              ? SiteWiseColors.paper
+              : CaptureColors.surface(0.12),
+          side: onLight ? const BorderSide(color: SiteWiseColors.border) : null,
+          padding: EdgeInsets.zero,
+          shape: const CircleBorder(),
+        ),
       ),
     ),
   );
@@ -166,20 +221,31 @@ class CameraScaffold extends StatelessWidget {
   final Widget? footer;
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: CaptureColors.cameraChrome,
-    body: SafeArea(
-      child: Column(
-        children: [
-          Expanded(child: body),
-          ?footer,
-        ],
+  Widget build(BuildContext context) => Theme(
+    // The app's default theme is the SiteWise light one, so a dark camera
+    // screen has to opt back into the dark scheme — otherwise a control that
+    // takes its colour from the theme (a bare `TextButton`, a divider) would
+    // render ink-on-ink over the feed.
+    data: captureAppTheme(),
+    child: Scaffold(
+      backgroundColor: CaptureColors.cameraChrome,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(child: body),
+            ?footer,
+          ],
+        ),
       ),
     ),
   );
 }
 
-/// The prototype's `.bt`.
+/// The prototype's `.bt` — SiteWise's primary action.
+///
+/// Blue `#1D4ED8`, white label, 50 dp tall and a 13 dp corner, exactly as the
+/// design reference draws it. The previous green fill was the most visible
+/// difference between this app and the SiteWise screens.
 class PrimaryButton extends StatelessWidget {
   const PrimaryButton({
     super.key,
@@ -193,61 +259,77 @@ class PrimaryButton extends StatelessWidget {
   final bool enabled;
 
   @override
-  Widget build(BuildContext context) => FilledButton(
-    onPressed: enabled ? onPressed : null,
-    style: FilledButton.styleFrom(
-      backgroundColor: CaptureColors.accent,
-      foregroundColor: Colors.white,
-      // `.bt:disabled{opacity:.45}` — the label stays legible, which a
-      // theme-default disabled grey does not.
-      disabledBackgroundColor: CaptureColors.accent.withValues(alpha: 0.45),
-      disabledForegroundColor: Colors.white.withValues(alpha: 0.45),
-      minimumSize: const Size.fromHeight(CaptureMetrics.buttonHeight),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(CaptureMetrics.cornerRadius),
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    enabled: enabled,
+    label: label,
+    child: FilledButton(
+      onPressed: enabled ? onPressed : null,
+      style: FilledButton.styleFrom(
+        backgroundColor: CaptureColors.primary,
+        foregroundColor: Colors.white,
+        // `.btn:hover{background:var(--blue-hover)}` — the pressed primary.
+        overlayColor: CaptureColors.primaryPressed,
+        // `.bt:disabled{opacity:.45}` — the label stays legible, which a
+        // theme-default disabled grey does not.
+        disabledBackgroundColor: CaptureColors.primary.withValues(alpha: 0.45),
+        disabledForegroundColor: Colors.white.withValues(alpha: 0.75),
+        minimumSize: const Size.fromHeight(CaptureMetrics.primaryButtonHeight),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
+        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
       ),
-      textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+      child: Text(label),
     ),
-    child: Text(label),
   );
 }
 
 /// The prototype's `.bt.g` — the quieter alternative next to a primary action.
+///
+/// Two variants, because the same control sits on two surfaces: white ghost
+/// chrome over the camera, and the reference's blue-on-white ghost on a light
+/// footer. [onLight] picks the second.
 class SecondaryButton extends StatelessWidget {
   const SecondaryButton({
     super.key,
     required this.label,
     required this.onPressed,
     this.enabled = true,
+    this.onLight = false,
   });
 
   final String label;
   final VoidCallback? onPressed;
   final bool enabled;
+  final bool onLight;
 
   @override
-  Widget build(BuildContext context) => OutlinedButton(
-    onPressed: enabled ? onPressed : null,
-    style: OutlinedButton.styleFrom(
-      foregroundColor: Colors.white,
-      // `.bt:disabled{opacity:.45}`, applied to the label. The outline cannot
-      // take the same value through `styleFrom`, so it is scaled by hand —
-      // 35 % white, dimmed by the same 45 %.
-      disabledForegroundColor: Colors.white.withValues(alpha: 0.45),
-      // `.bt.g{background:transparent;border:1px solid rgba(255,255,255,.35)}`.
-      backgroundColor: Colors.transparent,
-      side: BorderSide(
-        color: enabled
-            ? CaptureColors.ghostButtonBorder
-            : CaptureColors.ghostButtonBorderDisabled,
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    enabled: enabled,
+    label: label,
+    child: OutlinedButton(
+      onPressed: enabled ? onPressed : null,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: onLight ? CaptureColors.primary : Colors.white,
+        // `.bt:disabled{opacity:.45}`, applied to the label. The outline cannot
+        // take the same value through `styleFrom`, so it is scaled by hand.
+        disabledForegroundColor: onLight
+            ? CaptureColors.primary.withValues(alpha: 0.45)
+            : Colors.white.withValues(alpha: 0.45),
+        backgroundColor: onLight ? Colors.white : Colors.transparent,
+        side: BorderSide(
+          color: onLight
+              ? SiteWiseColors.borderStrong
+              : (enabled
+                    ? CaptureColors.ghostButtonBorder
+                    : CaptureColors.ghostButtonBorderDisabled),
+        ),
+        minimumSize: const Size.fromHeight(CaptureMetrics.primaryButtonHeight),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
+        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
       ),
-      minimumSize: const Size.fromHeight(CaptureMetrics.buttonHeight),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(CaptureMetrics.cornerRadius),
-      ),
-      textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+      child: Text(label),
     ),
-    child: Text(label),
   );
 }
 
@@ -289,21 +371,37 @@ class NoteCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // One widget, two surfaces. The note follows the scaffold it is in rather
+    // than taking a flag at every one of its dozen call sites, so a screen that
+    // moves to white cannot leave an invisible white-on-white card behind.
+    final light = Theme.of(context).brightness == Brightness.light;
     final color = switch (tone) {
-      NoteTone.neutral => CaptureColors.mutedOnDark,
-      NoteTone.warn => CaptureColors.warn,
-      NoteTone.ok => CaptureColors.ok,
-      NoteTone.danger => CaptureColors.danger,
+      NoteTone.neutral =>
+        light ? SiteWiseColors.muted : CaptureColors.mutedOnDark,
+      NoteTone.warn => light ? CaptureColors.warnOnLight : CaptureColors.warn,
+      NoteTone.ok => light ? CaptureColors.okOnLight : CaptureColors.ok,
+      NoteTone.danger =>
+        light ? CaptureColors.dangerOnLight : CaptureColors.danger,
     };
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
       decoration: BoxDecoration(
-        color: CaptureColors.noteOnDark,
-        border: tone == NoteTone.neutral
-            ? null
-            : Border.all(color: color.withValues(alpha: 0.55)),
+        color: light
+            ? (tone == NoteTone.neutral
+                  ? SiteWiseColors.paper
+                  : SiteWiseColors.softBlue)
+            : CaptureColors.noteOnDark,
+        border: Border.all(
+          color: light
+              ? (tone == NoteTone.neutral
+                    ? SiteWiseColors.border
+                    : color.withValues(alpha: 0.4))
+              : (tone == NoteTone.neutral
+                    ? Colors.transparent
+                    : color.withValues(alpha: 0.55)),
+        ),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
@@ -315,7 +413,11 @@ class NoteCard extends StatelessWidget {
           ],
           Expanded(
             child: DefaultTextStyle.merge(
-              style: const TextStyle(color: Colors.white, fontSize: 13),
+              style: TextStyle(
+                color: light ? SiteWiseColors.slate : Colors.white,
+                fontSize: 13,
+                height: 1.45,
+              ),
               child: child,
             ),
           ),
@@ -400,27 +502,23 @@ class ProvisionalLabel extends StatelessWidget {
   final String text;
 
   @override
-  Widget build(BuildContext context) => Row(
-    mainAxisSize: MainAxisSize.min,
-    children: [
-      const Icon(
-        Icons.info_outline,
-        size: 14,
-        color: CaptureColors.provisional,
-      ),
-      const SizedBox(width: 6),
-      Flexible(
-        child: Text(
-          text,
-          style: const TextStyle(
-            fontSize: 12,
-            color: CaptureColors.provisional,
-            height: 1.35,
+  Widget build(BuildContext context) {
+    final light = Theme.of(context).brightness == Brightness.light;
+    final color = light ? CaptureColors.warnOnLight : CaptureColors.provisional;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.info_outline, size: 15, color: color),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            text,
+            style: TextStyle(fontSize: 12, color: color, height: 1.4),
           ),
         ),
-      ),
-    ],
-  );
+      ],
+    );
+  }
 }
 
 /// A station marker on the floor plan.
@@ -590,6 +688,7 @@ class SphereProgressMap extends StatelessWidget {
     this.currentIndex,
     this.size = 240,
     this.showSamples = true,
+    this.onLight = false,
   });
 
   final List<PlanFrame> frames;
@@ -598,20 +697,45 @@ class SphereProgressMap extends StatelessWidget {
   final double size;
   final bool showSamples;
 
+  /// Whether the map sits on a white screen instead of the camera stage.
+  final bool onLight;
+
   @override
-  Widget build(BuildContext context) => SizedBox(
-    width: size,
-    height: size,
-    child: CustomPaint(
-      painter: _SphereMapPainter(
-        frames: frames,
-        statuses: statuses,
-        currentIndex: currentIndex,
-        samples: showSamples ? fibonacciSamples(1200) : null,
-        outline: CaptureColors.sphereOutline,
+  Widget build(BuildContext context) {
+    final done = statuses
+        .where((TargetStatus s) => s == TargetStatus.ok)
+        .length;
+    // One sentence, not thirty dots: the map is a picture of a count, and a
+    // screen reader announcing each node would be noise rather than progress.
+    final label =
+        'Capture progress map: $done of ${frames.length} photographs saved'
+        '${currentIndex == null ? '' : '. Current view ${currentIndex! + 1}'}';
+    return Semantics(
+      label: label,
+      image: true,
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: CustomPaint(
+          painter: _SphereMapPainter(
+            frames: frames,
+            statuses: statuses,
+            currentIndex: currentIndex,
+            samples: showSamples ? fibonacciSamples(1200) : null,
+            outline: onLight
+                ? CaptureColors.sphereOutlineOnLight
+                : CaptureColors.sphereOutline,
+            fill: onLight
+                ? CaptureColors.sphereFillOnLight
+                : CaptureColors.sphereFill,
+            pending: onLight
+                ? CaptureColors.pendingDotOnLight
+                : CaptureColors.pendingDot,
+          ),
+        ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _SphereMapPainter extends CustomPainter {
@@ -621,6 +745,8 @@ class _SphereMapPainter extends CustomPainter {
     required this.currentIndex,
     required this.samples,
     required this.outline,
+    required this.fill,
+    required this.pending,
   });
 
   final List<PlanFrame> frames;
@@ -628,13 +754,15 @@ class _SphereMapPainter extends CustomPainter {
   final int? currentIndex;
   final SphereSamples? samples;
   final Color outline;
+  final Color fill;
+  final Color pending;
 
   @override
   void paint(Canvas canvas, Size size) {
     final c = Offset(size.width / 2, size.height / 2);
     final r = size.width / 2 - 6;
 
-    canvas.drawCircle(c, r, Paint()..color = CaptureColors.sphereFill);
+    canvas.drawCircle(c, r, Paint()..color = fill);
     canvas.drawCircle(
       c,
       r,
@@ -671,7 +799,7 @@ class _SphereMapPainter extends CustomPainter {
       final color = switch (role) {
         SphereDotRole.ok => CaptureColors.ok,
         SphereDotRole.warn => CaptureColors.warn,
-        SphereDotRole.neutral => CaptureColors.pendingDot,
+        SphereDotRole.neutral => pending,
       };
       final o = project(frames[i].direction);
       final radius = currentIndex == i ? 7.0 : 4.5;
@@ -716,12 +844,14 @@ class RingProgressRow extends StatelessWidget {
     required this.done,
     required this.total,
     this.color = CaptureColors.ok,
+    this.onLight = false,
   });
 
   final String label;
   final int done;
   final int total;
   final Color color;
+  final bool onLight;
 
   @override
   Widget build(BuildContext context) => Padding(
@@ -738,7 +868,9 @@ class RingProgressRow extends StatelessWidget {
             child: LinearProgressIndicator(
               value: total == 0 ? 0 : done / total,
               minHeight: 8,
-              backgroundColor: CaptureColors.trackOnDark,
+              backgroundColor: onLight
+                  ? CaptureColors.trackOnLight
+                  : CaptureColors.trackOnDark,
               valueColor: AlwaysStoppedAnimation<Color>(color),
             ),
           ),

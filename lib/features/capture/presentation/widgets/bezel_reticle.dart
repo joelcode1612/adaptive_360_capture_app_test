@@ -167,29 +167,39 @@ class _BezelReticlePainter extends CustomPainter {
   final bool captureBlocked;
   final GlbModel? bezel;
 
-  static const Color _white = Color(0xFFF4F4F4);
-
   @override
   void paint(Canvas canvas, Size size) {
     final centre = Offset(size.width / 2, size.height / 2);
     final diameter = size.shortestSide;
     final model = bezel;
 
-    // Base ring: amber when another hard capture requirement fails, white when
-    // aimed, muted while not. The station-distance warning must outrank raw
-    // alignment: otherwise an aligned ring advertises a capture that the gate
-    // must refuse.
+    // Base ring. The state table the brief pins is green the moment alignment
+    // is real, amber when another hard capture requirement blocks the shutter,
+    // and neutral while the user is still turning. Green-on-alignment is what
+    // makes "correctly aligned" a confirmation rather than a same-coloured
+    // ring with a different fill; the half-opacity base keeps the hold sweep
+    // legible on top of it.
     final baseColor = completed || holdComplete
         ? CaptureColors.ok
         : (captureBlocked
               ? CaptureColors.warn
-              : (withinTolerance ? _white : CaptureColors.pendingDot));
+              : (withinTolerance
+                    ? CaptureColors.ok.withValues(alpha: 0.55)
+                    : CaptureColors.reticleIdle));
 
-    final base = Paint()..color = baseColor.withValues(alpha: 0.95);
+    final base = Paint()..color = baseColor;
+    // Two hairlines, not one: a dark outline lifts the ring off a white wall
+    // and a faint light halo lifts it off a dark corner. Together they are the
+    // "sufficient contrast for bright and dark environments" the brief asks
+    // for, without a glow or a shadow that would soften the aim edge.
     final shadow = Paint()
-      ..color = Colors.black.withValues(alpha: 0.45)
+      ..color = Colors.black.withValues(alpha: 0.62)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
+      ..strokeWidth = 2.6;
+    final halo = Paint()
+      ..color = Colors.white.withValues(alpha: 0.20)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5.2;
 
     final Path ring;
     final Paint progressPaint = Paint()..color = CaptureColors.ok;
@@ -201,20 +211,27 @@ class _BezelReticlePainter extends CustomPainter {
       ring = Path()..addOval(Rect.fromCircle(center: centre, radius: radius));
       progressPaint
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 3;
+        ..strokeWidth = 5;
       canvas.drawPath(
         ring,
         Paint()
-          ..color = Colors.black.withValues(alpha: 0.55)
+          ..color = Colors.black.withValues(alpha: 0.62)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 5,
+          ..strokeWidth = 8,
+      );
+      canvas.drawPath(
+        ring,
+        Paint()
+          ..color = Colors.white.withValues(alpha: 0.22)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 7,
       );
       canvas.drawPath(
         ring,
         Paint()
           ..color = baseColor
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 3,
+          ..strokeWidth = 5,
       );
     } else {
       ring = buildBezelRingPath(model, size: diameter).shift(
@@ -222,6 +239,7 @@ class _BezelReticlePainter extends CustomPainter {
       );
       // A dark hairline behind the ring keeps a white marker legible over a
       // white wall, which is exactly the surface this app is pointed at.
+      canvas.drawPath(ring, halo);
       canvas.drawPath(ring, shadow);
       canvas.drawPath(ring, base);
     }
