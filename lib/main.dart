@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/data/cloud/sitewise_auth.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/presentation/screens/sphere_capture_screen.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_flow_screen.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
@@ -18,7 +19,13 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/scre
 /// phone. The AR screen still forwards metric changes to Android, where the
 /// host refreshes ARCore's display geometry, but portrait-up keeps the capture
 /// directions and the user-facing guidance semantically stable.
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Supabase Auth is the only identity provider. Initialising it here means the
+  // session is restored once, before any screen asks who is signed in; the call
+  // is a no-op (and logs why) when the build has no project configured, which is
+  // a supported offline-only configuration.
+  await SitewiseSupabase.ensureInitialised();
   runApp(const VirtualTourApp());
 }
 
@@ -72,7 +79,7 @@ class CaptureLauncher extends StatelessWidget {
           const _Brand(),
           const SizedBox(height: 26),
           _LaunchCard(
-            title: 'AR 360° Capture (26 Targets)',
+            title: 'AR 360° Capture (38 Targets)',
             subtitle:
                 'Sphere-follows-phone capture with an automatic shutter and an '
                 'on-device 360° panorama. No ARCore, no calibration, no drift.',
@@ -253,9 +260,10 @@ class _ShellNote extends StatelessWidget {
       border: Border.all(color: SiteWiseColors.borderStrong),
     ),
     child: const Text(
-      'Photographs stay on this device until you export them. ARCore is used '
-      'only by the two AR paths; the guided flow needs a camera and motion '
-      'sensors.',
+      'Photographs and panoramas stay on this device. A finished panorama '
+      'uploads to SiteWise only when the build is configured for it and you are '
+      'signed in and authorised for the property. ARCore is used only by the two '
+      'AR paths; the guided flow needs a camera and motion sensors.',
       style: TextStyle(color: Color(0xFF1E3A8A), fontSize: 12, height: 1.5),
     ),
   );

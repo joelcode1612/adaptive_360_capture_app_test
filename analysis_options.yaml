@@ -20,6 +20,13 @@ analyzer:
     # here. The capture module's own coverage lives in `test/`, which is part of
     # the workspace and does run (`flutter test`).
     - tool/**
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the

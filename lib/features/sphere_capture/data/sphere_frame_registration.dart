@@ -1,0 +1,607 @@
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:opencv_dart/opencv_dart.dart' as cv;
+
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_intrinsics.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_registration.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
+
+/// One frame as the registration needs it: where its photograph is, where the
+/// sensor thinks it was pointing, and enough metadata to derive its intrinsics.
+///
+/// Deliberately a plain value type rather than the capture record map. The
+/// registration runs on a background isolate and must not depend on the shape of
+/// `records.json` beyond what the caller has already parsed out of it.
+class SphereRegistrationFrame {
+  const SphereRegistrationFrame({
+    required this.targetId,
+    required this.imagePath,
+    required this.rotation,
+    required this.savedWidth,
+    required this.savedHeight,
+    required this.sourceWidth,
+    required this.sourceHeight,
+    required this.cropOffsetX,
+    required this.cropOffsetY,
+  });
+
+  final int targetId;
+  final String imagePath;
+
+  /// Camera→world, the recorded `cameraOrientation`. The prior, never replaced.
+  final Quat rotation;
+
+  final int savedWidth;
+  final int savedHeight;
+  final int sourceWidth;
+  final int sourceHeight;
+  final int cropOffsetX;
+  final int cropOffsetY;
+}
+
+/// What the registration produced.
+///
+/// [rotations] is index-aligned with the input list. A frame with no trustworthy
+/// neighbour keeps its recorded quaternion, so this is always safe to project —
+/// there is no "registration failed, give up" state, which matters because the
+/// photographs cannot be retaken.
+class SphereRegistrationOutcome {
+  const SphereRegistrationOutcome({
+    required this.rotations,
+    required this.correctionDeg,
+    required this.pairsConsidered,
+    required this.acceptedEdges,
+    required this.rejectedEdges,
+    required this.featureTotal,
+    required this.elapsed,
+    required this.notes,
+  });
+
+  final List<Quat> rotations;
+
+  /// How far each frame ended up rotated from its recorded orientation, degrees.
+  final List<double> correctionDeg;
+
+  final int pairsConsidered;
+  final int acceptedEdges;
+  final int rejectedEdges;
+  final int featureTotal;
+  final Duration elapsed;
+
+  /// A short, human-readable sample of why edges were refused. Bounded on
+  /// purpose: a station where every wall is blank would otherwise produce
+  /// hundreds of identical strings.
+  final List<String> notes;
+
+  /// The identity outcome — every frame keeps the quaternion the sensor
+  /// recorded. Returned when registration is switched off, and used as the
+  /// fallback when nothing could be read at all.
+  static SphereRegistrationOutcome unrefined(
+    List<SphereRegistrationFrame> frames, {
+    String? note,
+  }) => SphereRegistrationOutcome(
+    rotations: <Quat>[for (final f in frames) f.rotation],
+    correctionDeg: List<double>.filled(frames.length, 0),
+    pairsConsidered: 0,
+    acceptedEdges: 0,
+    rejectedEdges: 0,
+    featureTotal: 0,
+    elapsed: Duration.zero,
+    notes: <String>[if (note != null) note],
+  );
+}
+
+/// The reduced decode used for feature detection.
+///
+/// Feature detection does not need 12 megapixels — ORB finds the same corners in
+/// a quarter-scale decode, and the decode itself is the expensive part. The final
+/// compositing decodes at a different reduction (see the stitcher), so sharpness
+/// is not decided here: this only decides *where* each frame points.
+const int kSphereRegistrationDecodeReduction = cv.IMREAD_REDUCED_COLOR_4;
+
+/// Features per frame. Enough for a texture-poor wall, few enough that 38 frames
+/// of descriptors stay under a couple of megabytes.
+const int kSphereRegistrationFeatures = 1200;
+
+/// Lowe's ratio. Above this the match is ambiguous and is dropped rather than
+/// left for RANSAC to sort out — RANSAC is good at rejecting outliers, not at
+/// rejecting matches that are wrong by a consistent amount.
+const double kSphereRegistrationRatio = 0.75;
+
+/// RANSAC reprojection tolerance, in registration pixels.
+const double kSphereRegistrationRansacPx = 4.0;
+
+/// Neighbours matched per frame. The layout's rings are 30–35° apart, so five
+/// neighbours covers both rings plus the ring above and below without ever
+/// matching a frame against the far side of the room.
+const int kSphereRegistrationNeighboursPerFrame = 5;
+
+/// Correspondences kept per pair. The estimate converges long before this; the
+/// cap exists so one unusually textured pair cannot dominate the station's total
+/// runtime.
+const int kSphereRegistrationMaxCorrespondences = 320;
+
+/// How many averaging sweeps run after the sequential pass.
+const int kSphereRegistrationAveragingPasses = 2;
+
+/// The correspondences one neighbour pair produced, cached so that refining a
+/// frame does not require matching it again.
+///
+/// This is the single most important performance decision in the file. Matching
+/// is the expensive half — a brute-force Hamming knn over ~1200 descriptors per
+/// side — while the rotation solve is arithmetic over at most
+/// [kSphereRegistrationMaxCorrespondences] points. Registration runs the solve
+/// several times per pair (once sequentially, then once per averaging sweep), and
+/// re-matching each time would multiply the station's cost by that count for
+/// exactly the same answer.
+class _PairMatches {
+  const _PairMatches({
+    required this.points,
+    required this.featureMatches,
+  });
+
+  /// Coordinates as `(first, second)` — the pair's lower index first.
+  final List<SphereCorrespondence> points;
+
+  /// How many unambiguous matches existed before RANSAC, for the inlier ratio.
+  final int featureMatches;
+
+  /// The same matches oriented for a solve that treats `second` as the frame
+  /// being corrected.
+  List<SphereCorrespondence> reversed() => <SphereCorrespondence>[
+    for (final SphereCorrespondence c in points)
+      SphereCorrespondence(
+        frameU: c.neighbourU,
+        frameV: c.neighbourV,
+        neighbourU: c.frameU,
+        neighbourV: c.frameV,
+      ),
+  ];
+}
+
+/// Refines every frame's orientation against the photographs that overlap it.
+///
+/// ## Order of work, and why
+///
+/// 1. **Decode once per frame, at quarter scale, and keep only descriptors.**
+///    Descriptors are reused across every pairing that frame takes part in. The
+///    incremental worker in `features/capture` re-decodes and re-detects the
+///    candidate image for every attempt, which is the difference between 38
+///    decodes and several hundred.
+/// 2. **Match neighbours only, once per pair.** Pairs come from the recorded
+///    quaternions, so the pair list is a property of the capture geometry rather
+///    than of the pixels — which is what keeps a repeated texture on two
+///    unrelated walls from ever being compared.
+/// 3. **RANSAC, then a rotation solve.** `findHomography` is used purely as an
+///    outlier filter: its inlier mask says which matches are geometrically
+///    consistent. The rotation itself is solved in
+///    [refineRotationFromCorrespondences] against the stitcher's own projection,
+///    so no homography is decomposed and no camera convention can be inverted.
+/// 4. **Sequential pass, then averaging.** See the note at step 3 in the body:
+///    correcting both sides of a pair from their priors doubles the error it is
+///    meant to remove.
+///
+/// A frame that fails at any step keeps its recorded quaternion. That is the
+/// low-texture path, and it is the common one: a blank wall produces no corners,
+/// so the sensor estimate is the best information available and is used as-is.
+SphereRegistrationOutcome registerSphereFrames({
+  required List<SphereRegistrationFrame> frames,
+  required double verticalFovDeg,
+  void Function(String stage)? onStage,
+}) {
+  if (frames.length < 2) {
+    return SphereRegistrationOutcome.unrefined(
+      frames,
+      note: 'A single photograph has nothing to register against.',
+    );
+  }
+  final stopwatch = Stopwatch()..start();
+
+  // ── 1. One decode, one detection, per frame ──────────────────────────
+  final descriptors = List<cv.Mat?>.filled(frames.length, null);
+  final keypoints = List<Float32List?>.filled(frames.length, null);
+  final projections = List<DecodedProjection?>.filled(frames.length, null);
+  final usable = List<bool>.filled(frames.length, false);
+  var featureTotal = 0;
+
+  cv.ORB? orb;
+  try {
+    orb = cv.ORB.create(nFeatures: kSphereRegistrationFeatures);
+    for (var i = 0; i < frames.length; i++) {
+      final frame = frames[i];
+      onStage?.call('Checking overlap: photograph ${i + 1}/${frames.length}…');
+      if (!File(frame.imagePath).existsSync()) continue;
+      cv.Mat? colour;
+      cv.Mat? gray;
+      try {
+        colour = cv.imread(
+          frame.imagePath,
+          flags: kSphereRegistrationDecodeReduction,
+        );
+        if (colour.isEmpty) continue;
+        gray = cv.cvtColor(colour, cv.COLOR_BGR2GRAY);
+        // Intrinsics for exactly this decode, from the same transform the
+        // projection uses — so a correspondence's pixels and its focal length
+        // are always in the same coordinate system.
+        final projection = decodedProjection(
+          decodedWidth: gray.cols,
+          decodedHeight: gray.rows,
+          savedWidth: frame.savedWidth,
+          savedHeight: frame.savedHeight,
+          sourceWidth: frame.sourceWidth,
+          sourceHeight: frame.sourceHeight,
+          verticalFovDeg: verticalFovDeg,
+          cropOffsetX: frame.cropOffsetX,
+          cropOffsetY: frame.cropOffsetY,
+        );
+        if (projection == null) continue;
+        projections[i] = projection;
+
+        final (detected, description) = orb.detectAndCompute(
+          gray,
+          cv.Mat.empty(),
+        );
+        final detectedCount = detected.length;
+        if (detectedCount < kSphereRegistrationMinInliers ||
+            description.isEmpty) {
+          detected.dispose();
+          description.dispose();
+          continue;
+        }
+        final points = Float32List(detectedCount * 2);
+        for (var k = 0; k < detectedCount; k++) {
+          points[k * 2] = detected[k].x;
+          points[k * 2 + 1] = detected[k].y;
+        }
+        detected.dispose();
+        descriptors[i] = description;
+        keypoints[i] = points;
+        featureTotal += detectedCount;
+        usable[i] = true;
+      } finally {
+        gray?.dispose();
+        colour?.dispose();
+      }
+    }
+
+    // ── 2. Neighbour pairs, from the recorded orientations ─────────────
+    final pairs = _neighbourPairs(frames);
+    onStage?.call(
+      'Matching ${pairs.length} overlapping pairs '
+      '(${frames.length} photographs)…',
+    );
+
+    // ── 3a. Match each pair exactly once ──────────────────────────────
+    final matches = List<_PairMatches?>.filled(pairs.length, null);
+    cv.BFMatcher? matcher;
+    try {
+      matcher = cv.BFMatcher.create(type: cv.NORM_HAMMING);
+      for (var p = 0; p < pairs.length; p++) {
+        final (i, j) = pairs[p];
+        if (!usable[i] || !usable[j]) continue;
+        matches[p] = _matchPair(
+          first: i,
+          second: j,
+          descriptors: descriptors,
+          keypoints: keypoints,
+          matcher: matcher,
+        );
+        if (p % 8 == 0) {
+          onStage?.call(
+            'Matching overlaps: ${p + 1}/${pairs.length} pairs '
+            '(${stopwatch.elapsed.inSeconds}s elapsed)…',
+          );
+        }
+      }
+    } finally {
+      matcher?.dispose();
+    }
+
+    // ── 3b. Refine, then average ──────────────────────────────────────
+    //
+    // **Sequential first.** Frames are visited in capture order and each is
+    // refined against neighbours that have *already* been refined. Refining both
+    // sides of a pair from their priors looks symmetric and is not: the matches
+    // measure the relative error *between* the two frames, so handing the whole
+    // of it to each side in turn doubles it, in opposite directions, and the seam
+    // ends up worse than it started. Anchoring each frame to an already-corrected
+    // neighbour assigns that relative error once.
+    //
+    // **Then averaging.** Every frame is re-refined against all its now-refined
+    // neighbours from a frozen snapshot, and the proposals are averaged before
+    // anything is applied. That removes the drift the sequential pass accumulates
+    // along the chain, and freezing the snapshot means no frame is corrected
+    // twice from the same measurement.
+    var accepted = 0;
+    var rejected = 0;
+    final notes = <String>[];
+    final rotations = <Quat>[for (final f in frames) f.rotation];
+    final settled = List<bool>.filled(frames.length, false);
+
+    final neighbours = List<List<int>>.generate(frames.length, (_) => <int>[]);
+    for (var p = 0; p < pairs.length; p++) {
+      if (matches[p] == null) continue;
+      neighbours[pairs[p].$1].add(p);
+      neighbours[pairs[p].$2].add(p);
+    }
+
+    SphereEdgeRefinement refine(int subject, int pairIndex) {
+      final cached = matches[pairIndex];
+      if (cached == null) return SphereEdgeRefinement.none;
+      final firstIsSubject = pairs[pairIndex].$1 == subject;
+      final reference = firstIsSubject ? pairs[pairIndex].$2 : pairs[pairIndex].$1;
+      final subjectProjection = projections[subject];
+      final referenceProjection = projections[reference];
+      if (subjectProjection == null || referenceProjection == null) {
+        return SphereEdgeRefinement.none;
+      }
+      return refineRotationFromCorrespondences(
+        frameRotation: rotations[subject],
+        neighbourRotation: rotations[reference],
+        frameProjection: subjectProjection,
+        neighbourProjection: referenceProjection,
+        correspondences: firstIsSubject ? cached.points : cached.reversed(),
+        featureMatches: cached.featureMatches,
+      );
+    }
+
+    void tally(SphereEdgeRefinement refinement, int targetId) {
+      if (refinement.accepted) {
+        accepted++;
+        return;
+      }
+      rejected++;
+      if (notes.length < 6 && refinement.rejection != null) {
+        notes.add('Frame $targetId: ${refinement.rejection}');
+      }
+    }
+
+    // The anchor defines the sphere's origin and is never moved: correcting it
+    // would rotate the entire panorama for no gain, since only relative
+    // orientation affects the seams.
+    if (frames.isNotEmpty) settled[0] = true;
+    for (var i = 1; i < frames.length; i++) {
+      if (!usable[i]) {
+        settled[i] = true;
+        continue;
+      }
+      final proposals = <SphereEdgeRefinement>[];
+      for (final pairIndex in neighbours[i]) {
+        final other = pairs[pairIndex].$1 == i
+            ? pairs[pairIndex].$2
+            : pairs[pairIndex].$1;
+        if (!settled[other]) continue;
+        final refinement = refine(i, pairIndex);
+        tally(refinement, frames[i].targetId);
+        proposals.add(refinement);
+      }
+      final correction = mergeSphereCorrections(proposals);
+      if (correction != null) {
+        rotations[i] = (correction * rotations[i]).normalized;
+      }
+      settled[i] = true;
+      if (i % 6 == 0) {
+        onStage?.call('Refining orientations: ${i + 1}/${frames.length}…');
+      }
+    }
+
+    for (var pass = 0; pass < kSphereRegistrationAveragingPasses; pass++) {
+      final snapshot = List<Quat>.of(rotations);
+      final updates = List<Quat?>.filled(frames.length, null);
+      for (var i = 1; i < frames.length; i++) {
+        if (!usable[i]) continue;
+        final proposals = <SphereEdgeRefinement>[];
+        for (final pairIndex in neighbours[i]) {
+          final refinement = refine(i, pairIndex);
+          if (refinement.accepted) {
+            accepted++;
+          } else {
+            rejected++;
+          }
+          proposals.add(refinement);
+        }
+        updates[i] = mergeSphereCorrections(proposals);
+      }
+      // Applied only after every frame has been measured, so the sweep is a
+      // Jacobi step and not a half-updated mixture of old and new rotations.
+      for (var i = 1; i < frames.length; i++) {
+        final update = updates[i];
+        if (update == null) continue;
+        rotations[i] = (update * snapshot[i]).normalized;
+      }
+      onStage?.call(
+        'Averaging orientations: sweep ${pass + 1}/'
+        '$kSphereRegistrationAveragingPasses…',
+      );
+    }
+
+    // ── 4. Report, keeping the prior wherever nothing was proven ───────
+    final correctionDeg = List<double>.filled(frames.length, 0);
+    var refinedFrames = 0;
+    for (var i = 0; i < frames.length; i++) {
+      correctionDeg[i] = sphereOrientationGapDeg(
+        frames[i].rotation,
+        rotations[i],
+      );
+      if (correctionDeg[i] > 0) refinedFrames++;
+    }
+    if (refinedFrames == 0) {
+      notes.add(
+        'No frame had a trustworthy overlap, so every photograph keeps its '
+        'recorded orientation.',
+      );
+    }
+
+    return SphereRegistrationOutcome(
+      rotations: rotations,
+      correctionDeg: correctionDeg,
+      pairsConsidered: pairs.length,
+      acceptedEdges: accepted,
+      rejectedEdges: rejected,
+      featureTotal: featureTotal,
+      elapsed: stopwatch.elapsed,
+      notes: notes,
+    );
+  } finally {
+    orb?.dispose();
+    for (final cv.Mat? d in descriptors) {
+      d?.dispose();
+    }
+  }
+}
+
+/// The overlapping frame pairs, nearest first, capped per frame.
+///
+/// Built from the recorded quaternions rather than from the pixels, so the cost
+/// of registration is decided before a single feature is computed. Pairs are
+/// sorted by angular distance and taken greedily, which keeps every frame's five
+/// closest neighbours and drops the rest.
+List<(int, int)> _neighbourPairs(List<SphereRegistrationFrame> frames) {
+  final candidates = <(int, int, double)>[];
+  for (var i = 0; i < frames.length; i++) {
+    for (var j = i + 1; j < frames.length; j++) {
+      final gap = sphereOrientationGapDeg(
+        frames[i].rotation,
+        frames[j].rotation,
+      );
+      if (gap > kSphereRegistrationNeighbourDeg) continue;
+      candidates.add((i, j, gap));
+    }
+  }
+  candidates.sort((a, b) => a.$3.compareTo(b.$3));
+
+  final perFrame = List<int>.filled(frames.length, 0);
+  final pairs = <(int, int)>[];
+  for (final (i, j, _) in candidates) {
+    if (perFrame[i] >= kSphereRegistrationNeighboursPerFrame) continue;
+    if (perFrame[j] >= kSphereRegistrationNeighboursPerFrame) continue;
+    perFrame[i]++;
+    perFrame[j]++;
+    pairs.add((i, j));
+  }
+  return pairs;
+}
+
+/// One neighbour pair: knn match, ratio test, RANSAC, correspondences.
+///
+/// Every OpenCV object created here is released here. A station is 38 frames and
+/// a few hundred pairs, and leaking a `Mat` per pair would exhaust a phone long
+/// before the last frame.
+_PairMatches? _matchPair({
+  required int first,
+  required int second,
+  required List<cv.Mat?> descriptors,
+  required List<Float32List?> keypoints,
+  required cv.BFMatcher matcher,
+}) {
+  final firstDescriptors = descriptors[first];
+  final secondDescriptors = descriptors[second];
+  final firstPoints = keypoints[first];
+  final secondPoints = keypoints[second];
+  if (firstDescriptors == null ||
+      secondDescriptors == null ||
+      firstPoints == null ||
+      secondPoints == null) {
+    return null;
+  }
+
+  cv.VecPoint2f? sourcePoints;
+  cv.VecPoint2f? destinationPoints;
+  cv.Mat? sourceMat;
+  cv.Mat? destinationMat;
+  cv.Mat? homography;
+  cv.Mat? mask;
+  try {
+    final knn = matcher.knnMatch(firstDescriptors, secondDescriptors, 2);
+    final kept = <(int, int)>[];
+    for (final row in knn) {
+      if (row.length < 2) continue;
+      final best = row[0];
+      final runnerUp = row[1];
+      if (best.distance < kSphereRegistrationRatio * runnerUp.distance) {
+        kept.add((best.queryIdx, best.trainIdx));
+      }
+    }
+    if (kept.length < kSphereRegistrationMinInliers) {
+      // Still returned rather than dropped: "only 4 matches" is the diagnostic a
+      // blank wall produces, and the caller reports it.
+      return _PairMatches(
+        points: const <SphereCorrespondence>[],
+        featureMatches: kept.length,
+      );
+    }
+
+    final srcList = <cv.Point2f>[];
+    final dstList = <cv.Point2f>[];
+    for (final (queryIndex, trainIndex) in kept) {
+      srcList.add(
+        cv.Point2f(
+          firstPoints[queryIndex * 2],
+          firstPoints[queryIndex * 2 + 1],
+        ),
+      );
+      dstList.add(
+        cv.Point2f(
+          secondPoints[trainIndex * 2],
+          secondPoints[trainIndex * 2 + 1],
+        ),
+      );
+    }
+    sourcePoints = cv.VecPoint2f.fromList(srcList);
+    destinationPoints = cv.VecPoint2f.fromList(dstList);
+    sourceMat = cv.Mat.fromVec(sourcePoints);
+    destinationMat = cv.Mat.fromVec(destinationPoints);
+    mask = cv.Mat.empty();
+    // Only the inlier mask is used. The homography itself is discarded: the
+    // rotation is solved against the projection, never decomposed from `H`.
+    homography = cv.findHomography(
+      sourceMat,
+      destinationMat,
+      method: cv.RANSAC,
+      ransacReprojThreshold: kSphereRegistrationRansacPx,
+      mask: mask,
+    );
+    if (homography.isEmpty) {
+      return _PairMatches(
+        points: const <SphereCorrespondence>[],
+        featureMatches: kept.length,
+      );
+    }
+
+    final points = <SphereCorrespondence>[];
+    for (var i = 0; i < kept.length; i++) {
+      if (mask.atU8(i) == 0) continue;
+      if (points.length >= kSphereRegistrationMaxCorrespondences) break;
+      points.add(
+        SphereCorrespondence(
+          frameU: srcList[i].x,
+          frameV: srcList[i].y,
+          neighbourU: dstList[i].x,
+          neighbourV: dstList[i].y,
+        ),
+      );
+    }
+    return _PairMatches(points: points, featureMatches: kept.length);
+  } catch (_) {
+    return null;
+  } finally {
+    homography?.dispose();
+    mask?.dispose();
+    sourceMat?.dispose();
+    destinationMat?.dispose();
+    sourcePoints?.dispose();
+    destinationPoints?.dispose();
+  }
+}
+
+/// The largest correction applied to any frame, in degrees — a single number for
+/// the coverage report and the progress log.
+double maxCorrectionDeg(List<double> corrections) {
+  var worst = 0.0;
+  for (final c in corrections) {
+    worst = math.max(worst, c);
+  }
+  return worst;
+}

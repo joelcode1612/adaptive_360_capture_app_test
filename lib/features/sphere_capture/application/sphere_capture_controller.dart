@@ -20,8 +20,14 @@ import 'package:adaptive_360_capture_app/features/capture/application/panorama_g
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_record.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/application/panorama_sync_service.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/data/local/capture_session_store.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/domain/capture_session.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/gallery_saver.dart';
-import 'package:adaptive_360_capture_app/features/sphere_capture/data/jpeg_normalizer.dart';
+// `NormalizedJpeg` lives in the domain layer (not in `jpeg_normalizer.dart`,
+// which links OpenCV) so this controller — and every test that drives it — does
+// not need the native stitching library to name the type.
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/normalized_jpeg.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/motion_detector.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_projection.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
@@ -98,13 +104,17 @@ class SphereCaptureController extends ChangeNotifier {
     required CaptureRepository repository,
     required PanoramaStitcher stitcher,
     required String stationId,
+    required Future<NormalizedJpeg> Function(Uint8List bytes) normalize,
     Stream<Vec3>? motion,
     PermissionService? permissions,
     Future<void> Function()? haptic,
     DateTime Function()? clock,
-    Future<NormalizedJpeg> Function(Uint8List bytes)? normalize,
     SphereExporter? export,
     GallerySaver? gallerySaver,
+    CaptureSessionStore? sessions,
+    PanoramaSyncService? sync,
+    String? userId,
+    int? propertyId,
     this.toleranceDeg = kSphereAlignmentToleranceDeg,
     this.exitToleranceDeg = kSphereAlignmentExitDeg,
     this.holdDuration = const Duration(milliseconds: 600),
@@ -117,9 +127,13 @@ class SphereCaptureController extends ChangeNotifier {
        _permissions = permissions ?? PermissionService(),
        _haptic = haptic ?? HapticFeedback.mediumImpact,
        _clock = clock ?? DateTime.now,
-       _normalize = normalize ?? const JpegNormalizer().normalize,
+       _normalize = normalize,
        _export = export ?? _defaultExport,
-       _gallery = gallerySaver ?? const GallerySaver();
+       _gallery = gallerySaver ?? const GallerySaver(),
+       _sessions = sessions,
+       _sync = sync,
+       _userId = userId,
+       _propertyId = propertyId;
 
   final RotationSource _rotation;
   final SphereCamera _camera;
@@ -133,6 +147,19 @@ class SphereCaptureController extends ChangeNotifier {
   final Future<NormalizedJpeg> Function(Uint8List bytes) _normalize;
   final SphereExporter _export;
   final GallerySaver _gallery;
+
+  /// The local-first metadata store, when one is attached.
+  ///
+  /// Optional so the capture flow still works if SQLite cannot be opened: a
+  /// metadata write failing must never cost the user a photograph. Every call
+  /// into it is guarded for exactly that reason.
+  final CaptureSessionStore? _sessions;
+
+  /// The upload queue, when Supabase is configured.
+  final PanoramaSyncService? _sync;
+
+  String? _userId;
+  int? _propertyId;
 
   /// The alignment cone that turns a target green and fills the ring.
   final double toleranceDeg;
@@ -196,6 +223,14 @@ class SphereCaptureController extends ChangeNotifier {
   String? _exportPath;
   String? _galleryPath;
 
+  /// The local synchronisation row for this session, when one exists.
+  PanoramaSyncRecord? _syncRecord;
+
+  /// The most recent upload attempt, so the completion sheet can say what
+  /// happened without re-reading SQLite on every frame.
+  SyncAttempt? _lastSyncAttempt;
+  bool _syncing = false;
+
   StreamSubscription<Quat>? _rotationSubscription;
   StreamSubscription<Vec3>? _motionSubscription;
   Timer? _bannerTimer;
@@ -251,6 +286,43 @@ class SphereCaptureController extends ChangeNotifier {
   String? get exportPath => _exportPath;
 
   bool get exporting => _exporting;
+
+  /// The session id, which is also the station directory name.
+  ///
+  /// The two are deliberately the same string: the SQLite row and the JPEG paths
+  /// on disk then describe one thing, so the stitcher keeps reading exactly the
+  /// paths it always read.
+  String get sessionId => _stationId;
+
+  /// `public.property.property_id` for this session, once one is chosen and the
+  /// association is verified. `null` means the panorama stays on the device.
+  int? get propertyId => _propertyId;
+
+  /// The account that owns this capture, when signed in.
+  String? get userId => _userId;
+
+  /// Whether an upload is running right now.
+  bool get syncing => _syncing;
+
+  /// The local synchronisation row, for the status line.
+  PanoramaSyncRecord? get syncRecord => _syncRecord;
+
+  /// The last attempt's outcome and message.
+  SyncAttempt? get lastSyncAttempt => _lastSyncAttempt;
+
+  /// A sentence about the cloud copy: uploading, uploaded, or why not.
+  String? get syncMessage => _lastSyncAttempt?.message ?? _syncRecord?.lastError;
+
+  /// Whether the cloud copy is confirmed by Supabase.
+  bool get isUploaded => _syncRecord?.status == PanoramaSyncStatus.uploaded;
+
+  /// Whether "Retry" should be offered: there is a panorama, and it is not
+  /// already in the cloud.
+  bool get canRetrySync {
+    final record = _syncRecord;
+    if (record == null || _panoramaPath == null) return false;
+    return record.status != PanoramaSyncStatus.uploaded && !_syncing;
+  }
 
   Quat? get deviceToWorld => _deviceToWorld;
 
@@ -408,6 +480,9 @@ class SphereCaptureController extends ChangeNotifier {
     _galleryPath = null;
     _notify();
     try {
+      // The session row exists before the camera does, so a capture that is
+      // interrupted on the very first frame still leaves a resumable record.
+      await _ensureSession();
       await _permissions.ensureCapturePermissions();
       await _camera.open();
       // The preview must be visible before the reference heading is taken.
@@ -668,6 +743,10 @@ class SphereCaptureController extends ChangeNotifier {
         toleranceDeg: toleranceDeg,
       );
       await _repository.saveRecord(record);
+      // Mirrored into SQLite after the JPEG and the JSON record exist. A
+      // failure here loses bookkeeping only, never the photograph, so it must
+      // not fail the capture.
+      await _persistFrame(record);
       debugPrint(
         'SPHERE_CAPTURE: target ${target.spec.targetId} saved '
         '${normalized.width}x${normalized.height} '
@@ -790,6 +869,10 @@ class SphereCaptureController extends ChangeNotifier {
         _panoramaPath = result.panoramaPath;
         _stitchError = null;
         debugPrint('SPHERE_STITCH: panorama at ${result.panoramaPath}');
+        // Persist the panorama and queue it for upload before the Gallery copy:
+        // the Gallery is a convenience, the cloud copy is the deliverable, and
+        // the local file is already safely on disk either way.
+        await _recordPanorama(result.panoramaPath!);
         // A Gallery copy is what the user can actually find in Photos. Its
         // failure must not turn a successful stitch into an error.
         try {
@@ -800,8 +883,13 @@ class SphereCaptureController extends ChangeNotifier {
         } catch (error) {
           debugPrint('GALLERY_SAVE: $error');
         }
+        // Offered to the network in the background: the completion sheet is
+        // usable while the upload runs, and a failure leaves a queued row
+        // rather than an error the user has to dismiss.
+        unawaited(_autoSync());
       } else {
         _stitchError = result.message;
+        await _recordPanoramaFailure(result.message);
         debugPrint('SPHERE_STITCH: failed: ${result.message}');
       }
     } catch (error) {
@@ -935,6 +1023,219 @@ class SphereCaptureController extends ChangeNotifier {
     _holdTargetId = null;
     _holdProgress = 0;
     _lastSampleAt = null;
+  }
+
+  /// Creates the session row, or restores the one already there, and repopulates
+  /// the target states from what is on disk.
+  ///
+  /// This is the "close the app and come back" path. It is deliberately the
+  /// first thing `start()` does, before permissions and before the camera: a
+  /// session that cannot be recorded is worth knowing about before the user
+  /// spends two minutes capturing, and a restored session lets them see their
+  /// progress immediately.
+  Future<void> _ensureSession() async {
+    final store = _sessions;
+    if (store == null) return;
+    try {
+      final session = await store.createSession(
+        sessionId: _stationId,
+        userId: _userId,
+        propertyId: _propertyId,
+      );
+      // A session created on a previous launch already knows its property; the
+      // in-memory value must follow it, or the upload would be queued without
+      // an association.
+      _propertyId ??= session.propertyId;
+      _userId ??= session.userId;
+      await restoreFromStore();
+      _syncRecord = await store.getPanorama(_stationId);
+      _notify();
+    } catch (error) {
+      // Local metadata is not worth failing a capture over. The JSON records the
+      // stitcher reads are written by `_repository` regardless.
+      debugPrint('SPHERE_SESSION: could not open session $_stationId: $error');
+    }
+  }
+
+  /// Marks the targets whose photographs are already saved as captured.
+  ///
+  /// A frame is only restored when its JPEG is still on disk: a row whose file
+  /// has been deleted describes evidence that no longer exists, and treating it
+  /// as captured would let the user reach 38 targets with 37 usable frames.
+  Future<void> restoreFromStore() async {
+    final store = _sessions;
+    if (store == null) return;
+    final frames = await store.loadFrames(_stationId);
+    if (frames.isEmpty) return;
+
+    final byTarget = <int, CapturedFrame>{
+      for (final frame in frames) frame.targetId: frame,
+    };
+    final restored = <SphereTargetState>[];
+    for (final target in _targets) {
+      final frame = byTarget[target.spec.targetId];
+      if (frame != null && File(frame.imagePath).existsSync()) {
+        restored.add(target.asCaptured(frame.imagePath));
+      } else {
+        restored.add(SphereTargetState(spec: target.spec));
+      }
+    }
+    _targets = restored;
+
+    // The stitch path continues from the last saved frame, so the guide arrow
+    // points at the next target in sequence rather than back at target 1.
+    final capturedIds = <int>[
+      for (final target in _targets)
+        if (target.captured) target.spec.targetId,
+    ]..sort();
+    if (capturedIds.isNotEmpty) {
+      final lastId = capturedIds.last;
+      for (final spec in buildSphereTargets()) {
+        if (spec.targetId == lastId) {
+          _lastCapturedDirection = spec.direction;
+          break;
+        }
+      }
+    }
+
+    final session = await store.getSession(_stationId);
+    if (session != null) {
+      // The property association and owner are part of the session, not of this
+      // launch: a capture resumed tomorrow must still know which building its
+      // panorama belongs to.
+      _propertyId ??= session.propertyId;
+      _userId ??= session.userId;
+      if (session.hasPanorama) {
+        _panoramaPath = session.localPanoramaPath;
+      }
+      if (session.panoramaStatus == PanoramaGenerationStatus.failed) {
+        _stitchError = session.lastError;
+      }
+    }
+    // The cloud state is part of what a reopen has to restore: a panorama that
+    // failed to upload must come back with its error and its Retry, not as a
+    // fresh "not uploaded yet".
+    _syncRecord = await store.getPanorama(_stationId);
+
+    if (capturedCount >= kSphereTargetCount) {
+      _phase = SphereCapturePhase.complete;
+    }
+    _recomputeGuide();
+    debugPrint(
+      'SPHERE_SESSION: restored $capturedCount/$kSphereTargetCount targets for '
+      '$_stationId',
+    );
+  }
+
+  /// Mirrors a saved JPEG into SQLite.
+  ///
+  /// Runs **after** the file and the JSON record exist, so a metadata failure
+  /// can only ever lose bookkeeping, never a photograph.
+  Future<void> _persistFrame(CaptureRecord record) async {
+    final store = _sessions;
+    if (store == null) return;
+    try {
+      await store.saveFrame(CapturedFrame.fromCaptureRecord(record));
+      if (capturedCount >= kSphereTargetCount) {
+        await store.markSessionStatus(
+          sessionId: _stationId,
+          status: CaptureSessionStatus.complete,
+        );
+      }
+    } catch (error) {
+      debugPrint(
+        'SPHERE_SESSION: target ${record.targetId} could not be recorded in '
+        'SQLite: $error',
+      );
+    }
+  }
+
+  /// Records the stitched panorama and queues it for upload.
+  Future<void> _recordPanorama(String panoramaPath) async {
+    final store = _sessions;
+    if (store == null) return;
+    try {
+      _syncRecord = await store.savePanorama(
+        sessionId: _stationId,
+        localPanoramaPath: panoramaPath,
+        status: PanoramaGenerationStatus.ready,
+      );
+      // `savePanorama` already writes the pending row; this makes the intent
+      // explicit and is a no-op when the row is already queued.
+      await store.markUploadPending(_stationId);
+      _syncRecord = await store.getPanorama(_stationId);
+    } catch (error) {
+      debugPrint('SPHERE_SESSION: panorama could not be recorded: $error');
+    }
+  }
+
+  Future<void> _recordPanoramaFailure(String? message) async {
+    final store = _sessions;
+    if (store == null) return;
+    try {
+      _syncRecord = await store.savePanorama(
+        sessionId: _stationId,
+        localPanoramaPath: null,
+        status: PanoramaGenerationStatus.failed,
+        error: message,
+      );
+    } catch (error) {
+      debugPrint('SPHERE_SESSION: panorama failure not recorded: $error');
+    }
+  }
+
+  /// Offers the finished panorama to the upload queue.
+  ///
+  /// Automatic, and deliberately quiet: a device with no session or no network
+  /// leaves a queued row behind, and nothing about the user's capture changes.
+  Future<void> _autoSync() async {
+    final sync = _sync;
+    if (sync == null) return;
+    _syncing = true;
+    _notify();
+    try {
+      _lastSyncAttempt = await sync.syncSession(_stationId);
+      _syncRecord = await _sessions?.getPanorama(_stationId) ?? _syncRecord;
+    } catch (error) {
+      debugPrint('SPHERE_SYNC: $error');
+    } finally {
+      _syncing = false;
+      _notify();
+    }
+  }
+
+  /// The user-initiated retry: re-arms a blocked row and ignores the backoff.
+  Future<void> retrySync() async {
+    final sync = _sync;
+    if (sync == null || _syncing) return;
+    _syncing = true;
+    _notify();
+    try {
+      _lastSyncAttempt = await sync.retry(_stationId);
+      _syncRecord = await _sessions?.getPanorama(_stationId) ?? _syncRecord;
+    } catch (error) {
+      debugPrint('SPHERE_SYNC: retry failed: $error');
+    } finally {
+      _syncing = false;
+      _notify();
+    }
+  }
+
+  /// Attaches the property this session's panorama belongs to.
+  ///
+  /// The association is chosen before upload; the server still verifies it
+  /// before storing a byte.
+  Future<void> attachProperty(int propertyId) async {
+    _propertyId = propertyId;
+    try {
+      await _sessions?.attachProperty(
+        sessionId: _stationId,
+        propertyId: propertyId,
+      );
+    } catch (error) {
+      debugPrint('SPHERE_SESSION: property association not recorded: $error');
+    }
+    _notify();
   }
 
   String _describe(Object error) {

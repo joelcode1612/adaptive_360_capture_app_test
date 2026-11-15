@@ -19,6 +19,11 @@ typedef StitchWorkerArgs = ({
   String stationDir,
   String outPath,
   int width,
+  /// Whether to refine each frame's recorded orientation against its
+  /// neighbours before projecting. Off is a legitimate setting: it makes a
+  /// re-stitch of an already-finished station fast, and it is the fallback when
+  /// a device cannot afford the extra decode pass.
+  bool refineRegistration,
   SendPort progress,
 });
 
@@ -64,6 +69,7 @@ class StitchJobRunner {
     required String stationDir,
     required String outPath,
     required int width,
+    bool refineRegistration = true,
     void Function(String stage)? onStage,
     void Function(Object error, StackTrace stack)? onError,
   }) async {
@@ -84,6 +90,7 @@ class StitchJobRunner {
       stationDir: stationDir,
       outPath: outPath,
       width: width,
+      refineRegistration: refineRegistration,
       progress: progress,
     );
     final subscription = progressPort.listen((dynamic message) {

@@ -5,8 +5,12 @@ import 'package:flutter/material.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/equirectangular_stitcher.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/data/jpeg_normalizer.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/application/sitewise_services.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/data/cloud/sitewise_auth.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/presentation/sign_in_screen.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/application/sphere_capture_controller.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_projection.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
@@ -35,6 +39,10 @@ class SphereCaptureScreen extends StatefulWidget {
     this.repository,
     this.stitcher,
     this.motionStream,
+    this.services,
+    this.sessionId,
+    this.userId,
+    this.propertyId,
   });
 
   /// Injection points for tests and for callers that already hold a station.
@@ -44,6 +52,19 @@ class SphereCaptureScreen extends StatefulWidget {
   final PanoramaStitcher? stitcher;
   final Stream<Vec3>? motionStream;
 
+  /// The local store, auth and upload queue. Built on first Start when omitted.
+  final SitewiseServices? services;
+
+  /// Resumes this exact session. When omitted, the newest unfinished session is
+  /// resumed, and a new one is created only if there is none.
+  final String? sessionId;
+
+  /// The signed-in account, when the caller already has one.
+  final String? userId;
+
+  /// `public.property.property_id` for the panorama this capture belongs to.
+  final int? propertyId;
+
   @override
   State<SphereCaptureScreen> createState() => _SphereCaptureScreenState();
 }
@@ -52,6 +73,7 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
     with WidgetsBindingObserver {
   SphereCaptureController? _controller;
   SphereCamera? _camera;
+  SitewiseServices? _services;
   bool _starting = false;
   String? _startError;
 
@@ -86,12 +108,36 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
       final rotation = widget.rotation ?? NativeRotationSource();
       final repository =
           widget.repository ?? await FileCaptureRepository.create();
+      final services = widget.services ?? await SitewiseServices.create();
+      final store = services.store;
+      // Resume before creating. A user who closed the app at target 31 must come
+      // back to target 31, not to a fresh 38-target session that orphans the 30
+      // photographs already on disk.
+      String stationId;
+      if (widget.sessionId != null) {
+        stationId = widget.sessionId!;
+      } else {
+        final resumable = await store?.findResumableSession(
+          userId: widget.userId,
+        );
+        stationId =
+            resumable?.sessionId ??
+            'sphere-${DateTime.now().millisecondsSinceEpoch}';
+      }
       final controller = SphereCaptureController(
         rotation: rotation,
         camera: camera,
         repository: repository,
         stitcher: widget.stitcher ?? const EquirectangularStitcher(),
-        stationId: 'sphere-${DateTime.now().millisecondsSinceEpoch}',
+        stationId: stationId,
+        // The 4:3 normaliser links OpenCV, so it is supplied here rather than
+        // defaulted inside the controller: that keeps the controller — and its
+        // tests — free of the native stitching library.
+        normalize: const JpegNormalizer().normalize,
+        sessions: store,
+        sync: services.sync,
+        userId: widget.userId,
+        propertyId: widget.propertyId,
         motion:
             widget.motionStream ??
             accelerometerEventStream(
@@ -102,6 +148,7 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
       setState(() {
         _controller = controller;
         _camera = camera;
+        _services = services;
         _starting = false;
       });
       await controller.start();
@@ -137,7 +184,11 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
         error: _startError,
       );
     }
-    return _LiveCapture(controller: controller, camera: camera);
+    return _LiveCapture(
+      controller: controller,
+      camera: camera,
+      services: _services,
+    );
   }
 }
 
@@ -378,10 +429,15 @@ class _SphereDiagramPainter extends CustomPainter {
 // ── live capture ───────────────────────────────────────────────────────────
 
 class _LiveCapture extends StatelessWidget {
-  const _LiveCapture({required this.controller, required this.camera});
+  const _LiveCapture({
+    required this.controller,
+    required this.camera,
+    this.services,
+  });
 
   final SphereCaptureController controller;
   final SphereCamera camera;
+  final SitewiseServices? services;
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -436,7 +492,10 @@ class _LiveCapture extends StatelessWidget {
           animation: controller,
           builder: (BuildContext context, Widget? child) {
             if (controller.phase == SphereCapturePhase.complete) {
-              return _CompletionOverlay(controller: controller);
+              return _CompletionOverlay(
+                controller: controller,
+                services: services,
+              );
             }
             if (controller.phase == SphereCapturePhase.failed) {
               return _FailureOverlay(controller: controller);
@@ -858,9 +917,10 @@ class _MotionChip extends StatelessWidget {
 }
 
 class _CompletionOverlay extends StatelessWidget {
-  const _CompletionOverlay({required this.controller});
+  const _CompletionOverlay({required this.controller, this.services});
 
   final SphereCaptureController controller;
+  final SitewiseServices? services;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -898,6 +958,10 @@ class _CompletionOverlay extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               _PanoramaStatus(controller: controller),
+              if (controller.panoramaPath != null) ...[
+                const SizedBox(height: 14),
+                _CloudStatus(controller: controller, services: services),
+              ],
               const SizedBox(height: 18),
               FilledButton.icon(
                 onPressed: controller.panoramaPath == null
@@ -1067,8 +1131,184 @@ class _PanoramaStatus extends StatelessWidget {
   }
 }
 
-class _FailureOverlay extends StatelessWidget {
-  const _FailureOverlay({required this.controller});
+/// The cloud half of the completion sheet.
+///
+/// Kept separate from [_PanoramaStatus] on purpose: a stitched panorama and a
+/// stored panorama are different facts, and conflating them is how an app ends
+/// up telling a user their work is "saved" when it is only on the phone.
+class _CloudStatus extends StatefulWidget {
+  const _CloudStatus({required this.controller, this.services});
+
+  final SphereCaptureController controller;
+  final SitewiseServices? services;
+
+  @override
+  State<_CloudStatus> createState() => _CloudStatusState();
+}
+
+class _CloudStatusState extends State<_CloudStatus> {
+  SitewiseAccount? _account;
+  bool _checked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAccount();
+  }
+
+  Future<void> _loadAccount() async {
+    final services = widget.services;
+    if (services == null) {
+      if (mounted) setState(() => _checked = true);
+      return;
+    }
+    final account = await services.auth.currentAccount();
+    if (!mounted) return;
+    setState(() {
+      _account = account;
+      _checked = true;
+    });
+  }
+
+  Future<void> _signIn() async {
+    final services = widget.services;
+    if (services == null) return;
+    final account = await Navigator.of(context).push<SitewiseAccount>(
+      MaterialPageRoute<SitewiseAccount>(
+        builder: (_) => SitewiseSignInScreen(
+          auth: services.auth,
+          reason: widget.controller.syncMessage,
+        ),
+      ),
+    );
+    if (!mounted || account == null) return;
+    setState(() => _account = account);
+    // Signing in is the fix for the most common block, so retrying immediately
+    // is the expected next step rather than a second tap the user must guess.
+    await widget.controller.retrySync();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: widget.controller,
+    builder: (BuildContext context, Widget? child) {
+      final controller = widget.controller;
+      final services = widget.services;
+      if (services == null || !services.canSync) {
+        return const Text(
+          'Cloud sync is not configured in this build, so the panorama stays on '
+          'this device. Pass the Supabase URL and publishable key at build time '
+          'to enable uploads.',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: CaptureColors.mutedOnDark,
+            fontSize: 10.5,
+            height: 1.4,
+          ),
+        );
+      }
+      if (controller.syncing) {
+        return const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            SizedBox(
+              width: 13,
+              height: 13,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 9),
+            Text(
+              'Uploading to SiteWise…',
+              style: TextStyle(
+                color: CaptureColors.mutedOnDark,
+                fontSize: 11.5,
+              ),
+            ),
+          ],
+        );
+      }
+      if (controller.isUploaded) {
+        return Column(
+          children: [
+            const Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.cloud_done, color: CaptureColors.ok, size: 15),
+                SizedBox(width: 6),
+                Text(
+                  'In SiteWise',
+                  style: TextStyle(
+                    color: CaptureColors.mutedOnDark,
+                    fontSize: 11.5,
+                  ),
+                ),
+              ],
+            ),
+            if (controller.syncRecord?.remoteObjectPath != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 3),
+                child: Text(
+                  controller.syncRecord!.remoteObjectPath!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: CaptureColors.linkOnDark,
+                    fontSize: 10,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+          ],
+        );
+      }
+      if (!_checked) {
+        return const SizedBox(height: 14);
+      }
+      final message =
+          controller.syncMessage ??
+          'The panorama is saved on this device and will upload when the '
+              'account and connection allow it.';
+      return Column(
+        children: [
+          Text(
+            message,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: CaptureColors.warn,
+              fontSize: 10.5,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (_account == null)
+                TextButton(
+                  onPressed: _signIn,
+                  style: TextButton.styleFrom(
+                    foregroundColor: CaptureColors.linkOnDark,
+                    minimumSize: const Size(0, CaptureMetrics.minTouchTarget),
+                  ),
+                  child: const Text('Sign in to upload'),
+                ),
+              if (controller.canRetrySync)
+                TextButton(
+                  onPressed: controller.retrySync,
+                  style: TextButton.styleFrom(
+                    foregroundColor: CaptureColors.linkOnDark,
+                    minimumSize: const Size(0, CaptureMetrics.minTouchTarget),
+                  ),
+                  child: const Text('Retry upload'),
+                ),
+            ],
+          ),
+        ],
+      );
+    },
+  );
+}
+
+class _FailureOverlay extends StatelessWidget {  const _FailureOverlay({required this.controller});
 
   final SphereCaptureController controller;
 

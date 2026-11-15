@@ -48,6 +48,8 @@ dependencies:
   # On-device panorama stitching for the 26-target AR capture, ported from the
   # FYP OpenCV pipeline. The 360° preview stitches locally; nothing is uploaded.
   opencv_dart: ^2.2.2
+  sqflite: ^2.4.6
+  supabase_flutter: ^2.18.3
 
 # Native asset build options for dartcv4 (opencv_dart). The stitching
 # module (plus its OpenCV dependencies) is required by the 360° panorama
@@ -83,6 +85,7 @@ dev_dependencies:
   # "initialise AR tracking".
   integration_test:
     sdk: flutter
+  sqflite_common_ffi: ^2.4.7
 
 flutter:
   uses-material-design: true

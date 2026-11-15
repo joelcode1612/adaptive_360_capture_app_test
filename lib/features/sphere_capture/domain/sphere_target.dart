@@ -107,7 +107,7 @@ const double kSphereAlignmentToleranceDeg = 5;
 /// deliberate turn must.
 const double kSphereAlignmentExitDeg = 7;
 
-/// One of the 26 directions, before any photograph exists.
+/// One of the 38 directions, before any photograph exists.
 class SphereTargetSpec {
   /// 1-based, 1…38.
   final int targetId;
