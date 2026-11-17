@@ -130,6 +130,7 @@ class EquirectangularStitcher implements PanoramaStitcher {
     }
     final outPath = p.join(stationDir, 'panorama.jpg');
     onStage?.call('Preparing ${imagePaths.length} photographs…');
+    await _diagnoseOpenCvRingPath(imagePaths);
     // The runner keeps the ReceivePort in this isolate and hands the worker
     // only a sendable record containing its SendPort. It also refuses a
     // second concurrent run for the same station.
@@ -141,7 +142,18 @@ class EquirectangularStitcher implements PanoramaStitcher {
       refineRegistration: refineRegistration,
       onStage: onStage,
     );
-    if (!result.ok) return StitchResult.failure(result.message);
+    if (!result.ok) {
+      debugPrint(
+        'FLUTTER_STITCH: CUSTOM_FALLBACK (pose projection) FAILED — '
+        '${result.message}',
+      );
+      return StitchResult.failure(result.message);
+    }
+    debugPrint(
+      'FLUTTER_STITCH: CUSTOM_FALLBACK (pose projection) ok — '
+      'frames=${imagePaths.length} canvas=${width}x${width ~/ 2} '
+      'assumedVFov=${kSphereAssumedVerticalFovDeg.toStringAsFixed(1)}deg',
+    );
     return StitchResult(
       success: true,
       panoramaPath: outPath,
@@ -1439,3 +1451,60 @@ double _clampDouble(double value, double min, double max) =>
 
 int _clampInt(int value, int min, int max) =>
     value < min ? min : (value > max ? max : value);
+
+/// Runs OpenCV's ring-first stitcher explicitly for diagnostics.
+///
+/// The 38-target spherical output still needs the known-pose renderer because
+/// Stitcher returns a flat panorama and has no Zenith/Nadir equirectangular
+/// contract. This attempt makes any OpenCV failure visible instead of silently
+/// implying that it produced the saved spherical JPEG.
+Future<void> _diagnoseOpenCvRingPath(List<String> imagePaths) async {
+  final ringPaths = <String>[
+    ...imagePaths.take(12),
+    ...imagePaths.skip(13).take(24),
+  ];
+  if (ringPaths.length != 36) {
+    debugPrint(
+      'FLUTTER_STITCH: OPENCV_STITCHER ring-first skipped — '
+      'expected 36 ring frames, got ${ringPaths.length}',
+    );
+    return;
+  }
+  final mats = <cv.Mat>[];
+  cv.Stitcher? stitcher;
+  cv.Mat? pano;
+  final watch = Stopwatch()..start();
+  try {
+    for (final path in ringPaths) {
+      final source = cv.imread(path, flags: cv.IMREAD_COLOR);
+      if (source.isEmpty) {
+        debugPrint('FLUTTER_STITCH: OPENCV_STITCHER ring decode failed: $path');
+        source.dispose();
+        return;
+      }
+      final resized = cv.resize(source, (960, 1280), interpolation: cv.INTER_LINEAR);
+      source.dispose();
+      mats.add(resized);
+    }
+    stitcher = cv.Stitcher.create(mode: cv.StitcherMode.PANORAMA)
+      ..panoConfidenceThresh = 0.4;
+    final input = cv.VecMat.fromList(mats);
+    final result = stitcher.stitch(input);
+    final status = result.$1;
+    pano = result.$2;
+    debugPrint(
+      'FLUTTER_STITCH: OPENCV_STITCHER ring-first frames=${mats.length} '
+      'input=960x1280 confidence=0.4 status=${status.name}(${status.index}) '
+      'elapsedMs=${watch.elapsedMilliseconds} '
+      'pano=${pano.isEmpty ? 'empty' : '${pano.cols}x${pano.rows}'}',
+    );
+  } catch (error) {
+    debugPrint('FLUTTER_STITCH: OPENCV_STITCHER ring-first exception: $error');
+  } finally {
+    pano?.dispose();
+    stitcher?.dispose();
+    for (final mat in mats) {
+      mat.dispose();
+    }
+  }
+}

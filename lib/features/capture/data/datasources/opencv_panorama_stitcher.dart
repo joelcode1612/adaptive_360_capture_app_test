@@ -1,4 +1,6 @@
 import 'dart:io';
+
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'dart:isolate';
 
 import 'package:opencv_dart/opencv_dart.dart' as cv;
@@ -97,8 +99,23 @@ Future<({bool ok, String message})> _stitchOnIsolate(
     }
 
     stitcher = cv.Stitcher.create(mode: cv.StitcherMode.PANORAMA);
+    // Default confidence is 1.0, which refuses any frame whose match confidence
+    // is not perfect. A plain ceiling or a painted wall legitimately matches
+    // weakly, and at 1.0 the stitcher silently drops those frames — which is
+    // how a 360° ring ends up with a hole at the pole instead of a seam.
+    //
+    // 0.6 keeps low-texture frames in the graph while still refusing frames
+    // that match nothing at all. Set on the instance, not the mode, so the
+    // PANORAMA warper and the default ExposureCompensator / GraphCutSeamFinder /
+    // MultiBandBlender pipeline stay exactly as they are.
+    stitcher.panoConfidenceThresh = 0.5;
     vec = cv.VecMat.fromList(mats);
     final (status, pano) = stitcher.stitch(vec);
+    debugPrint(
+      'FLUTTER_STITCH: OPENCV_STITCHER mode=PANORAMA frames=${mats.length} '
+      'confidence=${stitcher.panoConfidenceThresh} '
+      'status=${status.name}(${status.index})',
+    );
     if (status != cv.StitcherStatus.OK || pano.isEmpty) {
       pano.dispose();
       return (

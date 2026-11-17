@@ -57,6 +57,9 @@ class SphereRegistrationOutcome {
     required this.featureTotal,
     required this.elapsed,
     required this.notes,
+    this.meanResidualAfterPx = 0,
+    this.maxResidualAfterPx = 0,
+    this.residualSamples = 0,
   });
 
   final List<Quat> rotations;
@@ -74,6 +77,22 @@ class SphereRegistrationOutcome {
   /// purpose: a station where every wall is blank would otherwise produce
   /// hundreds of identical strings.
   final List<String> notes;
+
+  /// Mean reprojection error, in pixels, of the *accepted* edges after their
+  /// rotation correction was applied.
+  ///
+  /// This is the number that says whether the alignment actually worked: a
+  /// well-registered station sits around a pixel, and a value of several pixels
+  /// means the photographs disagree about structure even where RANSAC found
+  /// enough inliers to accept the pair. It is reported next to the coverage
+  /// numbers because coverage can be perfect while the alignment is poor.
+  final double meanResidualAfterPx;
+
+  /// Worst accepted edge's reprojection error, in pixels.
+  final double maxResidualAfterPx;
+
+  /// How many accepted edges those figures are averaged over.
+  final int residualSamples;
 
   /// The identity outcome — every frame keeps the quaternion the sensor
   /// recorded. Returned when registration is switched off, and used as the
@@ -316,6 +335,19 @@ SphereRegistrationOutcome registerSphereFrames({
     // twice from the same measurement.
     var accepted = 0;
     var rejected = 0;
+    // Residuals of the edges that were accepted, so the caller can report how
+    // well the alignment actually fits rather than only how many pairs passed.
+    var residualSum = 0.0;
+    var residualCount = 0;
+    var residualMax = 0.0;
+
+    void noteResidual(SphereEdgeRefinement refinement) {
+      final value = refinement.residualAfterPx;
+      if (!value.isFinite || value < 0) return;
+      residualSum += value;
+      residualCount++;
+      if (value > residualMax) residualMax = value;
+    }
     final notes = <String>[];
     final rotations = <Quat>[for (final f in frames) f.rotation];
     final settled = List<bool>.filled(frames.length, false);
@@ -350,6 +382,7 @@ SphereRegistrationOutcome registerSphereFrames({
     void tally(SphereEdgeRefinement refinement, int targetId) {
       if (refinement.accepted) {
         accepted++;
+        noteResidual(refinement);
         return;
       }
       rejected++;
@@ -397,6 +430,7 @@ SphereRegistrationOutcome registerSphereFrames({
           final refinement = refine(i, pairIndex);
           if (refinement.accepted) {
             accepted++;
+            noteResidual(refinement);
           } else {
             rejected++;
           }
@@ -443,6 +477,9 @@ SphereRegistrationOutcome registerSphereFrames({
       featureTotal: featureTotal,
       elapsed: stopwatch.elapsed,
       notes: notes,
+      meanResidualAfterPx: residualCount == 0 ? 0 : residualSum / residualCount,
+      maxResidualAfterPx: residualMax,
+      residualSamples: residualCount,
     );
   } finally {
     orb?.dispose();

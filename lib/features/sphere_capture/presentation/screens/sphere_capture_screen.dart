@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
+import 'package:adaptive_360_capture_app/features/capture_guide/presentation/screens/capture_guide_screen.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/equirectangular_stitcher.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/jpeg_normalizer.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
@@ -39,6 +40,7 @@ class SphereCaptureScreen extends StatefulWidget {
     this.repository,
     this.stitcher,
     this.motionStream,
+    this.gyroscopeStream,
     this.services,
     this.sessionId,
     this.userId,
@@ -51,6 +53,9 @@ class SphereCaptureScreen extends StatefulWidget {
   final CaptureRepository? repository;
   final PanoramaStitcher? stitcher;
   final Stream<Vec3>? motionStream;
+
+  /// Raw angular rate, rad/s. Injected in tests; defaults to `sensors_plus`.
+  final Stream<Vec3>? gyroscopeStream;
 
   /// The local store, auth and upload queue. Built on first Start when omitted.
   final SitewiseServices? services;
@@ -143,6 +148,13 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
             accelerometerEventStream(
               samplingPeriod: SensorInterval.normalInterval,
             ).map((AccelerometerEvent e) => Vec3(e.x, e.y, e.z)),
+        // Angular rate, for the freeze gate. Not the accelerometer: walking
+        // through a room is smooth in |a| but a turn is what rolls a shutter.
+        angularVelocity:
+            widget.gyroscopeStream ??
+            gyroscopeEventStream(
+              samplingPeriod: SensorInterval.gameInterval,
+            ).map((GyroscopeEvent e) => Vec3(e.x, e.y, e.z)),
       );
       if (!mounted) return;
       setState(() {
@@ -754,6 +766,18 @@ class _TopBar extends StatelessWidget {
         builder: (BuildContext context, Widget? child) =>
             _MotionChip(moving: controller.moving),
       ),
+      const SizedBox(width: 8),
+      // In-session help: opens the native capture guide on top of the live
+      // session. The controller below stays mounted and keeps its state, so
+      // reopening the instructions never restarts or resets the capture.
+      _GlassButton(
+        icon: Icons.help_outline,
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => const CaptureGuideScreen(showStartAction: false),
+          ),
+        ),
+      ),
       const Spacer(),
       SphereProgressMap(controller: controller),
     ],
@@ -1024,15 +1048,20 @@ class _CompletionOverlay extends StatelessWidget {
     final navigator = Navigator.of(context);
     final path = await controller.saveAndFinish();
     if (!context.mounted) return;
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(
-          path == null
-              ? controller.message ?? 'The export failed.'
-              : 'Exported $kSphereTargetCount photographs and the panorama to $path',
-        ),
-      ),
-    );
+    // Save & Finish after a failed stitch still exports the photographs — that
+    // is deliberate, they are the user's work — but it must not claim a
+    // panorama was produced. `panoramaPath` is only set when the stitcher
+    // returned success *and* the JPEG exists and is non-empty, so it is the
+    // honest test here.
+    final hasPanorama = controller.panoramaPath != null;
+    final message = path == null
+        ? controller.message ?? 'The export failed.'
+        : hasPanorama
+        ? 'Exported $kSphereTargetCount photographs and the panorama to $path'
+        : 'Exported $kSphereTargetCount photographs to $path. No panorama was '
+              'generated — the photographs are kept, so you can retry stitching '
+              'from the review screen without recapturing.';
+    messenger.showSnackBar(SnackBar(content: Text(message)));
     if (path != null) navigator.pop();
   }
 }

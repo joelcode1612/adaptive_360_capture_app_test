@@ -1,7 +1,9 @@
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:adaptive_360_capture_app/features/capture_guide/presentation/screens/capture_guide_screen.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/data/cloud/sitewise_auth.dart';
-import 'package:adaptive_360_capture_app/features/sphere_capture/presentation/screens/sphere_capture_screen.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/data/opencv_native_probe.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_flow_screen.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/screens/virtual_tour_camera_screen.dart';
@@ -26,6 +28,18 @@ Future<void> main() async {
   // is a no-op (and logs why) when the build has no project configured, which is
   // a supported offline-only configuration.
   await SitewiseSupabase.ensureInitialised();
+  // Debug-only native smoke test. It calls one OpenCV binding per module against
+  // the library actually installed on this device and logs a line each
+  // (`SPHERE_NATIVE: imgproc/cvtColor ok`). A module that was compiled out shows
+  // up here at launch instead of at the end of a 38-target capture.
+  //
+  // Debug-only on purpose: the stitcher runs the same probe in every build
+  // before it projects, so a release build still fails with the actionable
+  // message rather than a raw symbol-lookup error — without paying for the check
+  // at every cold start.
+  if (kDebugMode) {
+    OpenCvNativeProbe.log(OpenCvNativeProbe.run());
+  }
   runApp(const VirtualTourApp());
 }
 
@@ -84,9 +98,13 @@ class CaptureLauncher extends StatelessWidget {
                 'Sphere-follows-phone capture with an automatic shutter and an '
                 'on-device 360° panorama. No ARCore, no calibration, no drift.',
             icon: Icons.threesixty,
+            // The guide always comes before a new capture session: it opens
+            // the real capture screen only from its final Start Capture
+            // action, so no camera or controller exists while the user
+            // reads.
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
-                builder: (_) => const SphereCaptureScreen(),
+                builder: (_) => const CaptureGuideScreen(),
               ),
             ),
           ),

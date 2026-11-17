@@ -11,8 +11,8 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capt
 /// The 38-node capture progress map for the top-right corner.
 ///
 /// It draws the same `buildSphereTargets()` directions the projection and the
-/// shutter use, orthographically with a slight tilt so the three rings read as
-/// a sphere rather than three lines. Four things have to be distinguishable at
+/// shutter use, orthographically and untilted, so each ring projects to a
+/// horizontal line and a dot's ring is unambiguous at this size. Four things have to be distinguishable at
 /// 58 logical pixels, and they are separated by **shape**, not only colour, so
 /// the map still works for a colour-blind user:
 ///
@@ -95,7 +95,21 @@ class _SphereProgressPainter extends CustomPainter {
   /// first rotation sample.
   final Vec3? look;
 
-  static const double _tiltDeg = 18;
+  /// Tilt of the viewing direction, in degrees. **Zero, deliberately.**
+  ///
+  /// The map used to be drawn from 18° above, which is prettier and wrong for
+  /// this job. Under a downward view the near half of the equator projects
+  /// *above* the disc's centre: a middle-ring target at the front landed at
+  /// `sin 18° ≈ 0.31` of the radius up, while the upper ring landed at 0.80 and
+  /// the lower ring at −0.29. At 58 px that puts the middle ring visibly high on
+  /// the disc, and it reads as "the app is capturing the upper ring" — which is
+  /// exactly how it was reported.
+  ///
+  /// With no tilt the three rings project to three horizontal lines: the middle
+  /// ring *is* the horizontal midline, the upper ring sits at +sin 35° ≈ 0.57 R
+  /// and the lower at −0.57 R. The ring a dot belongs to is then readable
+  /// without decoding a 3-D cue that does not survive the size.
+  static const double _tiltDeg = 0;
 
   @override
   void paint(Canvas canvas, Size size) {

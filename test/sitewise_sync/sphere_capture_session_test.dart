@@ -165,6 +165,12 @@ class FakeCamera implements SphereCamera {
   Future<Uint8List> takePicture() async => Uint8List(0);
 
   @override
+  Future<void> lockCaptureSettings() async {}
+
+  @override
+  Future<void> unlockCaptureSettings() async {}
+
+  @override
   Future<void> close() async => _open = false;
 
   @override

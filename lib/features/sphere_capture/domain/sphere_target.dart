@@ -100,12 +100,27 @@ const double kSphereRadiusM = 1.0;
 const double kSphereRingPitchDeg = 35;
 
 /// The alignment cone that turns a target green and starts the hold ring.
-const double kSphereAlignmentToleranceDeg = 5;
+///
+/// **2.0°.** At the previous 5° the shutter fired while the marker was still
+/// visibly off the reticle: on a 576 × 768 viewfinder at the assumed 65° vFOV
+/// the focal is ≈603 px, so 5° is ≈53 px — a sixth of the frame width. 2.0° is
+/// ≈21 px, which reads as centred, and it is the value the capture
+/// specification asks for.
+///
+/// Achievability: the rotation vector is fused, so its noise is a fraction of a
+/// degree, and the shutter additionally requires the phone to be angularly
+/// still for 250 ms ([MotionFreezeGate]) plus a 600 ms hold inside the cone. A
+/// sensor too noisy to satisfy 2° cannot complete the hold, which is the correct
+/// failure — no photograph rather than a mis-aimed one.
+const double kSphereAlignmentToleranceDeg = 2.0;
 
 /// How far past the tolerance the error must go before a filling hold is
 /// discarded. A hand tremor at the boundary must not reset the ring, but a
 /// deliberate turn must.
-const double kSphereAlignmentExitDeg = 7;
+///
+/// 1.3× the cone, matching the previous 5°/7° ratio so the hysteresis behaves
+/// as it always has.
+const double kSphereAlignmentExitDeg = 2.6;
 
 /// One of the 38 directions, before any photograph exists.
 class SphereTargetSpec {

@@ -26,6 +26,22 @@ abstract class SphereCamera {
   /// One full-resolution JPEG.
   Future<Uint8List> takePicture();
 
+  /// Locks exposure and focus so the whole sweep shares one tone and one focal
+  /// plane.
+  ///
+  /// Called once the first photograph is in: by then the auto-exposure loop has
+  /// converged on real content, so the locked values describe the room rather
+  /// than whatever the camera happened to be pointing at while the preview
+  /// started. Locking earlier would freeze a mid-convergence exposure and make
+  /// every one of the 38 frames wrong together, which is worse than varying.
+  ///
+  /// Default body does nothing, so a fake camera needs no implementation.
+  Future<void> lockCaptureSettings() async {}
+
+  /// Releases the locks, returning the camera to auto. Called when the session
+  /// ends, so a later capture is not stuck with this room's exposure.
+  Future<void> unlockCaptureSettings() async {}
+
   Future<void> close();
 
   /// Completes once the camera is open **and its preview has had a chance to
@@ -150,6 +166,42 @@ class PluginSphereCamera implements SphereCamera {
         );
       },
     );
+  }
+
+  /// Locks AE and AF. Both calls are best-effort: a device that refuses one
+  /// still gets the other, and a device that refuses both still captures.
+  @override
+  Future<void> lockCaptureSettings() async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    try {
+      await controller.setExposureMode(ExposureMode.locked);
+      debugPrint('SPHERE_CAMERA: exposure locked');
+    } on CameraException catch (error) {
+      debugPrint('SPHERE_CAMERA: exposure lock refused (${error.code})');
+    }
+    try {
+      await controller.setFocusMode(FocusMode.locked);
+      debugPrint('SPHERE_CAMERA: focus locked');
+    } on CameraException catch (error) {
+      debugPrint('SPHERE_CAMERA: focus lock refused (${error.code})');
+    }
+  }
+
+  @override
+  Future<void> unlockCaptureSettings() async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    try {
+      await controller.setExposureMode(ExposureMode.auto);
+    } on CameraException {
+      // Nothing to release.
+    }
+    try {
+      await controller.setFocusMode(FocusMode.auto);
+    } on CameraException {
+      // Nothing to release.
+    }
   }
 
   @override

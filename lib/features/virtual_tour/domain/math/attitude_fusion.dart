@@ -57,6 +57,12 @@ class AttitudeFusion {
   Quat _deviceToWorld = Quat.identity;
   bool _lastSampleUsedGravity = false;
 
+  /// Whether a real gravity sample has been applied in full yet.
+  ///
+  /// Until it has, the estimate is only a gyro integration from identity, which
+  /// is *not* the horizon unless the phone happens to be perfectly upright.
+  bool _gravityInitialised = false;
+
   AttitudeFusion({
     this.beta = 0.05,
     this.gravityWindow = const (min: 6.9, max: 12.8),
@@ -81,6 +87,9 @@ class AttitudeFusion {
   void reset() {
     _deviceToWorld = Quat.identity;
     _lastSampleUsedGravity = false;
+    // Re-armed: the next usable accelerometer sample re-establishes the horizon
+    // in one step instead of easing toward it.
+    _gravityInitialised = false;
   }
 
   /// The gravity direction the model expects, in device coordinates.
@@ -129,6 +138,35 @@ class AttitudeFusion {
     }
     final measured = accelMs2.normalized;
     final expected = expectedGravityDevice;
+
+    // ── First usable gravity sample: solve tilt, do not ease into it ──────
+    //
+    // `beta` is a *fraction of the error per step*, which is the right rule for
+    // a running filter and the wrong rule for the first sample. Starting from
+    // identity, the horizon spends roughly 1/β steps — about 0.4 s at 20 ms —
+    // converging, so the first frames show a tilted horizon: the middle ring
+    // sits off the reticle at exactly the moment the user is aiming with it.
+    //
+    // The first accelerometer reading that passes the gravity window is a
+    // direct measurement of up, so the whole error is applied at once. The
+    // correction axis is perpendicular to gravity, so this fixes pitch and roll
+    // and leaves heading untouched at its initial value of 0 — which is what
+    // puts the first middle-ring target dead ahead.
+    if (!_gravityInitialised) {
+      _gravityInitialised = true;
+      _lastSampleUsedGravity = true;
+      final snapAxis = measured.cross(expected);
+      final snapLen = snapAxis.length;
+      if (snapLen >= 1e-9) {
+        final snapDeg =
+            math.atan2(snapLen, measured.dot(expected)) * radToDeg;
+        _deviceToWorld =
+            (_deviceToWorld *
+                    Quat.axisAngle(snapDeg, snapAxis.normalized))
+                .normalized;
+      }
+      return;
+    }
 
     // δ rotates `measured` onto `expected`, and is applied on the right so it
     // acts in the device frame. The axis is perpendicular to both up-vectors,

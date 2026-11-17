@@ -55,13 +55,25 @@ class PsqlError(RuntimeError):
 
 
 def find_bin(name: str) -> str:
-    """Locate a PostgreSQL client binary, preferring PATH."""
-    found = shutil.which(name)
-    if found:
-        return found
-    candidates = sorted(Path("C:/Program Files/PostgreSQL").glob(f"*/bin/{name}.exe"))
+    r"""Locate a PostgreSQL client binary.
+
+    The PostgreSQL install directory is searched **before** PATH, and a PATH hit
+    is only accepted when it really is a PostgreSQL binary. On a developer
+    machine with Oracle XE installed, ``shutil.which("createdb")`` returns
+    ``...\oraclexe\...\bin\createdb.BAT`` — a different program that prints
+    "ORACLE_HOME must be set" and exits 0. Trusting it made this harness report a
+    scratch database as created when nothing had been created, and every
+    assertion afterwards failed with "database does not exist".
+    """
+    candidates = sorted(
+        Path("C:/Program Files/PostgreSQL").glob(f"*/bin/{name}.exe"),
+        key=lambda p: p.parent.parent.name,
+    )
     if candidates:
         return str(candidates[-1])
+    found = shutil.which(name)
+    if found and "postgres" in found.lower():
+        return found
     raise SystemExit(
         f"{name} not found. Add the PostgreSQL bin directory to PATH, or pass "
         f"--psql-dir."

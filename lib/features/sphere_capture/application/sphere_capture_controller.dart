@@ -12,6 +12,7 @@ import 'package:camera/camera.dart' show CameraException;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:path/path.dart' as p;
+
 import 'package:path_provider/path_provider.dart';
 
 import 'package:adaptive_360_capture_app/core/error/failures.dart';
@@ -29,6 +30,7 @@ import 'package:adaptive_360_capture_app/features/sphere_capture/data/gallery_sa
 // not need the native stitching library to name the type.
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/normalized_jpeg.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/motion_detector.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/motion_freeze_gate.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_projection.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/scalars.dart';
@@ -106,6 +108,7 @@ class SphereCaptureController extends ChangeNotifier {
     required String stationId,
     required Future<NormalizedJpeg> Function(Uint8List bytes) normalize,
     Stream<Vec3>? motion,
+    Stream<Vec3>? angularVelocity,
     PermissionService? permissions,
     Future<void> Function()? haptic,
     DateTime Function()? clock,
@@ -124,6 +127,7 @@ class SphereCaptureController extends ChangeNotifier {
        _stitcher = stitcher,
        _stationId = stationId,
        _motionStream = motion,
+       _angularVelocityStream = angularVelocity,
        _permissions = permissions ?? PermissionService(),
        _haptic = haptic ?? HapticFeedback.mediumImpact,
        _clock = clock ?? DateTime.now,
@@ -141,6 +145,10 @@ class SphereCaptureController extends ChangeNotifier {
   final PanoramaStitcher _stitcher;
   final String _stationId;
   final Stream<Vec3>? _motionStream;
+
+  /// Raw gyroscope, rad/s. Null in tests and on a device without one, in which
+  /// case the freeze gate is skipped rather than blocking every capture.
+  final Stream<Vec3>? _angularVelocityStream;
   final PermissionService _permissions;
   final Future<void> Function() _haptic;
   final DateTime Function() _clock;
@@ -171,6 +179,11 @@ class SphereCaptureController extends ChangeNotifier {
   final Duration holdDuration;
 
   final MotionDetector _motionDetector = MotionDetector();
+
+  /// How long the phone must have been angularly still before the shutter.
+  final MotionFreezeGate _freezeGate = MotionFreezeGate();
+
+  StreamSubscription<Vec3>? _gyroSubscription;
 
   List<SphereTargetState> _targets = <SphereTargetState>[
     for (final SphereTargetSpec spec in buildSphereTargets())
@@ -504,6 +517,11 @@ class SphereCaptureController extends ChangeNotifier {
       if (motion != null) {
         _motionSubscription = motion.listen(_onMotionSample);
       }
+      final gyro = _angularVelocityStream;
+      if (gyro != null) {
+        _freezeGate.reset();
+        _gyroSubscription = gyro.listen(_onGyroSample);
+      }
       _message = 'Aligning the sphere…';
       _notify();
       // Wait for a fresh, settled sample to establish the reference heading.
@@ -674,7 +692,13 @@ class SphereCaptureController extends ChangeNotifier {
         _holdProgress =
             (_holdProgress + dtSeconds / (holdDuration.inMilliseconds / 1000))
                 .clamp(0.0, 1.0);
-        if (_holdProgress >= 1.0 && !_capturing) {
+        // The hold proves the target is *centred*; the freeze gate proves the
+        // phone has *stopped*. A still taken mid-sweep satisfies the cone for a
+        // sample and still skews a vertical wall, so both are required. With no
+        // gyroscope (tests, or a device without one) the gate is skipped rather
+        // than blocking every capture.
+        final frozen = _angularVelocityStream == null || _freezeGate.still;
+        if (_holdProgress >= 1.0 && !_capturing && frozen) {
           unawaited(_capture(active));
         }
       } else if (activeError > exitToleranceDeg) {
@@ -696,6 +720,12 @@ class SphereCaptureController extends ChangeNotifier {
     _notify();
   }
 
+  /// Feeds the freeze gate. Deliberately does not notify: the stream runs at
+  /// ~50 Hz and rebuilding the overlay for it would cost more than it shows.
+  void _onGyroSample(Vec3 rateRadPerSec) {
+    _freezeGate.update(rateRadPerSec, _clock());
+  }
+
   Future<void> _capture(SphereTargetState target) async {
     if (_capturing) return;
     final device = _deviceToWorld;
@@ -704,12 +734,23 @@ class SphereCaptureController extends ChangeNotifier {
     // the instant the JPEG finished encoding: rotation samples keep arriving
     // during `takePicture`, and reading the live field afterwards would record
     // an angle the user had already turned away from.
-    final errorAtShutter = _activeErrorDeg;
     _capturing = true;
     _phase = SphereCapturePhase.capturing;
     _holdProgress = 0;
     _notify();
     try {
+      // Let the pipeline flush before the shutter.
+      //
+      // CameraX keeps a small pool of in-flight buffers; on a device driven
+      // hard by preview and stills the JPEG can be served from a frame captured
+      // ~100-200 ms earlier — a pose the user has already left, which is one
+      // half of the double-image overlay. 150 ms is longer than the buffer
+      // queue's latency and short enough that the shutter does not feel slow.
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      // Read the pose *after* the flush, immediately before the shutter, so it
+      // describes the frame that will be captured rather than the instant the
+      // hold completed.
+      final errorAtShutter = _activeErrorDeg;
       final raw = await _camera.takePicture();
       final normalized = await _normalize(raw);
       final path = await _repository.framePath(
@@ -771,6 +812,12 @@ class SphereCaptureController extends ChangeNotifier {
         await _haptic();
       } catch (_) {
         // Ignored on purpose.
+      }
+      // The first photograph establishes the exposure and focus for the whole
+      // sweep: AE/AF have now converged on the room rather than on whatever the
+      // preview saw while it was starting.
+      if (capturedCount == 1) {
+        await _camera.lockCaptureSettings();
       }
       _banner = 'Captured!';
       _bannerTimer?.cancel();
@@ -1256,7 +1303,11 @@ class SphereCaptureController extends ChangeNotifier {
     _bannerTimer?.cancel();
     unawaited(_rotationSubscription?.cancel());
     unawaited(_motionSubscription?.cancel());
+    unawaited(_gyroSubscription?.cancel());
     unawaited(_rotation.stop());
+    // Release the locks before closing: the next session must not inherit this
+    // room's exposure.
+    unawaited(_camera.unlockCaptureSettings());
     unawaited(_camera.close());
     super.dispose();
   }
