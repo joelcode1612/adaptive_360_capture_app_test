@@ -12,13 +12,13 @@ import 'package:adaptive_360_capture_app/features/sphere_capture/data/equirectan
 /// isolate — because each one is a function over typed arrays and nothing about
 /// it needs a device.
 void main() {
-  group('exposure gains', () {
+  group('per-channel median colour gains', () {
     test('pulls a brighter photograph down to its neighbour', () {
       // Frame 1 sees the same wall at twice the brightness of frame 0. The
       // correction must halve frame 1, not double it — the sign is the whole
       // point of this test.
       const pixelCount = 64;
-      final gains = solveExposureGains(
+      final gains = solveChannelMedianGains(
         pixelCount: pixelCount,
         frameCount: 2,
         bestFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 1),
@@ -28,13 +28,13 @@ void main() {
         bestColour: _flatColour(pixelCount, 200),
         secondColour: _flatColour(pixelCount, 100),
       );
-      expect(gains.length, 2);
-      expect(gains[1] / gains[0], closeTo(0.5, 0.02));
+      expect(gains.length, 6);
+      expect(gains[1 * 3] / gains[0 * 3], closeTo(0.5, 0.02));
     });
 
     test('leaves an evenly exposed pair at unity', () {
       const pixelCount = 64;
-      final gains = solveExposureGains(
+      final gains = solveChannelMedianGains(
         pixelCount: pixelCount,
         frameCount: 2,
         bestFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 1),
@@ -45,14 +45,14 @@ void main() {
         secondColour: _flatColour(pixelCount, 128),
       );
       expect(gains[0], closeTo(1.0, 0.001));
-      expect(gains[1], closeTo(1.0, 0.001));
+      expect(gains[1 * 3 + 2], closeTo(1.0, 0.001));
     });
 
     test('does not trust a pair it has barely seen', () {
       // Ten overlapping pixels is not evidence of an exposure difference; a
       // handful of samples on a textured edge would otherwise set the gain.
       const pixelCount = 10;
-      final gains = solveExposureGains(
+      final gains = solveChannelMedianGains(
         pixelCount: pixelCount,
         frameCount: 2,
         bestFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 1),
@@ -63,24 +63,54 @@ void main() {
         secondColour: _flatColour(pixelCount, 100),
       );
       expect(gains[0], closeTo(1.0, 1e-9));
-      expect(gains[1], closeTo(1.0, 1e-9));
+      expect(gains[1 * 3 + 1], closeTo(1.0, 1e-9));
     });
 
-    test('normalises so the panorama does not drift overall', () {
+    test('clamps a correction the evidence cannot justify', () {
+      // A 4× brightness ratio is not an exposure difference the solver is
+      // allowed to "fix" wholesale: the clamp stops at 1.35× up, 0.75× down.
       const pixelCount = 64;
-      final gains = solveExposureGains(
+      final gains = solveChannelMedianGains(
         pixelCount: pixelCount,
         frameCount: 2,
         bestFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 1),
         secondFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 0),
         bestWeight: Float32List(pixelCount)..fillRange(0, pixelCount, 1),
         secondWeight: Float32List(pixelCount)..fillRange(0, pixelCount, 1),
-        bestColour: _flatColour(pixelCount, 200),
-        secondColour: _flatColour(pixelCount, 100),
+        bestColour: _flatColour(pixelCount, 255),
+        secondColour: _flatColour(pixelCount, 60),
       );
-      // Only ratios are observable, so the geometric mean must stay at 1.
-      final mean = (gains[0] + gains[1]) / 2;
-      expect(mean, closeTo(1.0, 0.001));
+      expect(gains[1 * 3], closeTo(0.65, 1e-9));
+      expect(gains[0 * 3], closeTo(1.0, 1e-9));
+    });
+
+    test('corrects channels independently', () {
+      // Frame 1 sees the same wall with a magenta cast: red doubled, green
+      // and blue identical. Only the red gain may move.
+      const pixelCount = 64;
+      final best = Uint8List(pixelCount * 3);
+      final second = Uint8List(pixelCount * 3);
+      for (var i = 0; i < pixelCount; i++) {
+        best[i * 3] = 200;
+        best[i * 3 + 1] = 100;
+        best[i * 3 + 2] = 100;
+        second[i * 3] = 100;
+        second[i * 3 + 1] = 100;
+        second[i * 3 + 2] = 100;
+      }
+      final gains = solveChannelMedianGains(
+        pixelCount: pixelCount,
+        frameCount: 2,
+        bestFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 1),
+        secondFrame: Int16List(pixelCount)..fillRange(0, pixelCount, 0),
+        bestWeight: Float32List(pixelCount)..fillRange(0, pixelCount, 1),
+        secondWeight: Float32List(pixelCount)..fillRange(0, pixelCount, 1),
+        bestColour: best,
+        secondColour: second,
+      );
+      expect(gains[1 * 3], closeTo(0.5, 0.02));
+      expect(gains[1 * 3 + 1], closeTo(1.0, 0.001));
+      expect(gains[1 * 3 + 2], closeTo(1.0, 0.001));
     });
   });
 
@@ -95,8 +125,7 @@ void main() {
         output[i * 3 + 1] = 90;
         output[i * 3 + 2] = 60;
       }
-      final bestWeight = Float32List(pixelCount)
-        ..fillRange(0, pixelCount, 1);
+      final bestWeight = Float32List(pixelCount)..fillRange(0, pixelCount, 1);
       // A 2x2 hole in the middle, exactly as an uncovered direction appears.
       final hole = <int>[
         1 * width + 3,
@@ -157,8 +186,7 @@ void main() {
       const pixelCount = width * height;
       final output = Uint8List(pixelCount * 3)
         ..fillRange(0, pixelCount * 3, 100);
-      final bestWeight = Float32List(pixelCount)
-        ..fillRange(0, pixelCount, 1);
+      final bestWeight = Float32List(pixelCount)..fillRange(0, pixelCount, 1);
       for (var x = 0; x < width; x++) {
         final i = x;
         bestWeight[i] = 0;
@@ -196,8 +224,7 @@ void main() {
 
     test('a polar hole is small in area and large in a view', () {
       // Zero the top ten rows: latitude 90 down to 80.
-      final hits = Uint8List(width * height)
-        ..fillRange(0, width * height, 1);
+      final hits = Uint8List(width * height)..fillRange(0, width * height, 1);
       const holeRows = 10;
       for (var y = 0; y < holeRows; y++) {
         for (var x = 0; x < width; x++) {
@@ -205,11 +232,7 @@ void main() {
         }
       }
 
-      final result = worstViewportGap(
-        hits: hits,
-        width: width,
-        height: height,
-      );
+      final result = worstViewportGap(hits: hits, width: width, height: height);
 
       // Area-weighted, this hole is a fraction of a percent of the sphere — the
       // number the old gate looked at, and the reason a black disc could pass it.
@@ -228,18 +251,13 @@ void main() {
     });
 
     test('an equatorial hole is reported too', () {
-      final hits = Uint8List(width * height)
-        ..fillRange(0, width * height, 1);
+      final hits = Uint8List(width * height)..fillRange(0, width * height, 1);
       for (var y = 86; y < 94; y++) {
         for (var x = 0; x < width; x++) {
           hits[y * width + x] = 0;
         }
       }
-      final result = worstViewportGap(
-        hits: hits,
-        width: width,
-        height: height,
-      );
+      final result = worstViewportGap(hits: hits, width: width, height: height);
       expect(result.gap, greaterThan(0.0));
       expect(result.latitudeDeg.abs(), lessThan(20));
     });

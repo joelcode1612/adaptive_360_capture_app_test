@@ -12,25 +12,37 @@ import 'package:adaptive_360_capture_app/features/capture/domain/services/panora
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/sphere_frame_registration.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/stitch_job_runner.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/equirect_bounds.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/seam_blend.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_intrinsics.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 
 /// A guaranteed full-sphere equirectangular panorama from the 3DoF captures.
 ///
-/// ## Why not OpenCV's feature-based Stitcher
+/// ## The pose projection, with an optional OpenCV band
 ///
-/// On device, `cv::Stitcher` returned a partial fan of the room: it dropped
-/// frames it could not confidently register instead of covering the sphere.
-/// That is the wrong failure mode for a 360° product — a hole cannot be
-/// retried without recapturing.
+/// A pure `cv::Stitcher` run was tried and abandoned: on device it returned a
+/// partial fan of the room, dropping frames it could not confidently register
+/// — and a hole cannot be retried without recapturing. It is also a single
+/// synchronous native call over 36 images with no progress events: on the
+/// phone it holds the completion dialog on one message for minutes, so it is
+/// **off by default** ([kSphereEnableCvStitcher]).
 ///
-/// This stitcher does not *depend* on feature matching for coverage. Every frame
-/// already has a measured device quaternion in `records.json`, so its orientation
-/// relative to the first frame is known. Each frame is projected onto the
-/// equirectangular canvas through that rotation, and every canvas pixel takes a
-/// weighted average of the photographs that reach it. Coverage is therefore
-/// complete by construction, and no frame can be "rejected".
+/// The production path is therefore the pose projection: every frame has a
+/// measured device quaternion in `records.json`, refined against ORB/RANSAC
+/// feature matches, and coverage is complete by construction. Each frame is
+/// projected onto the equirectangular canvas through that rotation, rendered
+/// at full opacity on one side of a graph-cut seam, gain-matched across it,
+/// and gap-filled. It finishes in seconds and no frame can be "rejected".
+///
+/// For experiments, `--dart-define=sphere_cv_stitch=true` adds a first tier:
+/// the 36 ring frames (zenith/nadir excluded) are decoded at 720×960 and
+/// stitched with `cv.Stitcher` (PANORAMA, confidence 0.35), and when it returns
+/// OK its gain-compensated, multi-band-blended output is embedded over the
+/// equatorial band with a 40-pixel vertical gradient, the pole caps remaining
+/// pose-projected. Any non-OK status is logged verbatim
+/// (`STITCHER_FAILED_STATUS:`) and the pose projection stands — the same
+/// behaviour as the default path.
 ///
 /// ## Registration
 ///
@@ -47,24 +59,28 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quate
 /// ## Blending
 ///
 /// Averaging all overlapping frames ghosted badly wherever two rings disagreed
-/// by a few degrees — because they *did* disagree, by more than a degree, before
-/// registration existed. The canvas used to keep the nearest frame per pixel and
-/// blend only where the best and second-best weights were within 3%; at 3% the
-/// transition is a few pixels wide, so the seam read as a cut and tore where the
-/// frames disagreed.
+/// by a few degrees — and indoors they disagree by 20–45 px of parallax on
+/// anything close: the wardrobe went translucent (the white wall showed
+/// through it), the chair grew a second seat, because both positions were
+/// drawn at roughly half opacity across the whole overlap.
 ///
-/// It is now a normalised weighted average of the top two contributors over the
-/// whole overlap. The weights already fall off toward a frame's edge and toward
-/// grazing angles, so the blend fades exactly where each photograph stops being
-/// trustworthy, and there is no rectangular boundary left to see.
+/// It is now **seam compositing** — `compositeSeams` in `seam_blend.dart`.
+/// Every canvas pixel is owned by exactly one photograph: a graph cut
+/// (`graph_cut_seams.dart`) routes the ownership boundary through content the
+/// frames agree on and around the objects they do not, and each pixel is
+/// rendered at 100% opacity from its owner alone. The only cross-fade is a
+/// narrow [kSeamFeatherPx]-pixel feather strictly across the seam line, so no
+/// object is ever drawn at partial opacity from two positions.
 ///
-/// Three corrections sit on top of that choice:
+/// Two corrections sit on top of that choice:
 ///
-/// * **Exposure.** Every photograph is exposed by its own auto-exposure loop, so
-///   neighbouring frames of the same wall differ in brightness and every seam is
-///   also a step. [solveExposureGains] and [solveExposureOffsets] recover a gain
-///   and an offset per photograph from the pixels two frames share, and the blend
-///   applies both.
+/// * **Colour.** Every photograph is exposed and white-balanced by its own
+///   auto loop, so neighbouring frames of the same wall differ in brightness
+///   and hue, and every seam would also be a step — a bright curtain meeting
+///   a dark one reads as jagged stair-cases. [solveChannelMedianGains]
+///   recovers one bounded gain per frame **per channel** from the medians of
+///   the pixels frames genuinely share, so the curtain and wall brightness
+///   match across the seam without luminance jumps.
 /// * **Gaps.** Uncovered pixels used to be left at zero, which is why a missed
 ///   direction read as a black disc rather than as a soft patch. [fillUncovered]
 ///   now propagates colour outward from the covered boundary. The station is
@@ -130,7 +146,10 @@ class EquirectangularStitcher implements PanoramaStitcher {
     }
     final outPath = p.join(stationDir, 'panorama.jpg');
     onStage?.call('Preparing ${imagePaths.length} photographs…');
-    await _diagnoseOpenCvRingPath(imagePaths);
+    // The OpenCV feature-based Stitcher now runs *inside* the background
+    // isolate (`_stitchRingWithOpenCv`) as the primary source for the
+    // equatorial band. The old main-isolate diagnostic is gone: it duplicated
+    // the ring decode and blocked the UI thread for the whole stitch.
     // The runner keeps the ReceivePort in this isolate and hands the worker
     // only a sendable record containing its SendPort. It also refuses a
     // second concurrent run for the same station.
@@ -161,6 +180,17 @@ class EquirectangularStitcher implements PanoramaStitcher {
     );
   }
 }
+
+/// Whether the optional OpenCV feature-stitched band is attempted at all.
+///
+/// Off by default. `cv.Stitcher.stitch()` is one synchronous native call over
+/// 36 images — pairwise matching, bundle adjustment, gain compensation and
+/// multi-band blending — with no progress events or cancellation. On a phone
+/// that can hold the completion dialog on a single message for minutes with
+/// no result, and the rotation-refined pose projection already produces a
+/// complete, aligned sphere. Enable explicitly with
+/// `--dart-define=sphere_cv_stitch=true` for A/B comparison runs only.
+const bool kSphereEnableCvStitcher = bool.fromEnvironment('sphere_cv_stitch');
 
 /// Whether the stitcher's verbose diagnostics are compiled in. Off unless the
 /// run asks for it: `--dart-define=sphere_stitch_log=true`.
@@ -304,6 +334,30 @@ int resolveSphereStitchWidth(int requested) {
     );
   }
 
+  // The pose projection below is the production path: it finishes in seconds
+  // and is complete by construction. The OpenCV band is an opt-in experiment
+  // (see [kSphereEnableCvStitcher]) because its single native `stitch()` call
+  // can hold the UI on one message for minutes with no progress or result.
+  // Skipping it here avoids the stall entirely; the status is written to the
+  // coverage report so a run that used the fast path says so.
+  final stitcherStartedMs = stopwatch.elapsedMilliseconds;
+  final ({cv.Mat? pano, String status}) stitchAttempt;
+  if (kSphereEnableCvStitcher) {
+    progress.send('Matching 36 ring frames with OpenCV (optional experiment)…');
+    stitchAttempt = _stitchRingWithOpenCv(
+      records: records,
+      progress: progress.send,
+    );
+  } else {
+    debugPrint(
+      'FLUTTER_STITCH: OPENCV_STITCHER skipped — disabled by default; '
+      'rotation-refined pose projection is the production path '
+      '(enable with --dart-define=sphere_cv_stitch=true)',
+    );
+    stitchAttempt = (pano: null, status: 'disabled-by-default');
+  }
+  final stitcherMs = stopwatch.elapsedMilliseconds - stitcherStartedMs;
+
   final height = width ~/ 2;
   // Stage timing. No speed-up may be claimed without measurement, so every stage
   // is measured and written into the coverage report — a claim about this
@@ -324,8 +378,7 @@ int resolveSphereStitchWidth(int requested) {
   // scalar, so a blended pixel has to remember which two photographs it came
   // from — the colour alone cannot say. `-1` means "no photograph reached here",
   // and it is also how the gap fill finds the holes without re-testing weights.
-  final bestFrame = Int16List(width * height)
-    ..fillRange(0, width * height, -1);
+  final bestFrame = Int16List(width * height)..fillRange(0, width * height, -1);
   final secondFrame = Int16List(width * height)
     ..fillRange(0, width * height, -1);
   // How many frames actually see each pixel. Saturating at 3: the audit only
@@ -360,7 +413,9 @@ int resolveSphereStitchWidth(int requested) {
   // released before the next opens, so the peak is one frame (about 38 MB for a
   // 12 MP still) on top of the accumulator — which is why the accumulator budget
   // is checked separately in [resolveSphereStitchWidth].
-  final decodeFlag = width <= 2048 ? cv.IMREAD_REDUCED_COLOR_2 : cv.IMREAD_COLOR;
+  final decodeFlag = width <= 2048
+      ? cv.IMREAD_REDUCED_COLOR_2
+      : cv.IMREAD_COLOR;
   for (var frameIndex = 0; frameIndex < records.length; frameIndex++) {
     final record = records[frameIndex];
     final path = record['imagePath'] as String?;
@@ -377,8 +432,8 @@ int resolveSphereStitchWidth(int requested) {
       // accepted an edge for this frame and the recorded one otherwise. The
       // first frame defines the sphere's origin, and its own rotation is left
       // untouched by construction, so the reference does not drift with it.
-      final cameraToSphere = (anchor.conjugate * rotations[frameIndex])
-          .normalized;
+      final cameraToSphere =
+          (anchor.conjugate * rotations[frameIndex]).normalized;
       final sphereToCamera = cameraToSphere.conjugate;
 
       final imageWidth = mat.cols;
@@ -428,8 +483,16 @@ int resolveSphereStitchWidth(int requested) {
       }
       final pixels = mat.data;
       final rowStride = imageWidth * 3;
-      final marginX = 0.05 * imageWidth;
-      final marginY = 0.05 * imageHeight;
+      // Pole frames get a wider margin: their footprint on the sphere is a
+      // small cap, so a few aim degrees of error leave a black crescent
+      // between the Upper Ring and the Zenith. Keeping edge pixels that the
+      // ring frames would reject closes that crescent without moving any
+      // pixel's geometry — the gain solve and feather handle the falloff.
+      final targetId = (record['targetId'] as num?)?.toInt() ?? -1;
+      final isPole = targetId == 13 || targetId == 38;
+      final isNadir = targetId == 38;
+      final marginX = (isPole ? 0.16 : 0.05) * imageWidth;
+      final marginY = (isPole ? 0.16 : 0.05) * imageHeight;
 
       final bounds = equirectFrameBounds(
         cameraToSphere,
@@ -535,7 +598,27 @@ int resolveSphereStitchWidth(int requested) {
             dv,
           );
 
+          // The Nadir frame meets the Lower Ring along a circle. Its binary
+          // footprint is polygonal at 2048×1024, which reads as a stair-step
+          // floor seam. Erode the outer mask by 6 px, then apply a radial
+          // cosine fade over the outer 30% of the frame: at r=0.7 the factor
+          // is 1, at r=1 it is 0, with zero derivative at both ends. The ring
+          // frames take over smoothly where the Nadir lets go.
           var weight = _pow6(depth);
+          if (isNadir) {
+            if (u < 6 || u > imageWidth - 7 || v < 6 || v > imageHeight - 7) {
+              continue;
+            }
+            final r = math.sqrt(
+              ((u - cx) / (imageWidth / 2)) * ((u - cx) / (imageWidth / 2)) +
+                  ((v - cy) / (imageHeight / 2)) *
+                      ((v - cy) / (imageHeight / 2)),
+            );
+            if (r > 0.7) {
+              if (r >= 1.0) continue;
+              weight *= 0.5 * (1 + math.cos(math.pi * (r - 0.7) / 0.3));
+            }
+          }
           weight *= _smoothStep(_min(u, imageWidth - 1 - u) / marginX);
           weight *= _smoothStep(_min(v, imageHeight - 1 - v) / marginY);
           if (weight <= 0) continue;
@@ -573,17 +656,18 @@ int resolveSphereStitchWidth(int requested) {
 
   final projectionMs = lapMs();
   progress.send('Blending panorama and encoding JPEG…');
-  // Every photograph was exposed by its own auto-exposure loop, so two frames of
-  // the same white wall can differ by 10-20%. Correct that before blending, or
-  // every seam is also a brightness step.
+  // Every photograph was exposed and white-balanced by its own auto loop, so
+  // two frames of the same wall can differ by 10-20% in brightness and a few
+  // percent per channel. Correct that before compositing, or every seam is
+  // also a step — and a step across a bright-to-dark curtain reads as jagged
+  // stair-cases.
   //
-  // Two parameters per frame, not one. A gain alone cannot fix a scene where the
-  // camera also shifted its black point — a window that blew out one frame leaves
-  // the rest of that frame lifted, and scaling it down darkens the wall instead
-  // of levelling it. `detail::GainCompensator` is not exposed by dartcv4 2.2.2,
-  // so the equivalent is solved here: gain from the ratio of the shared means,
-  // then offset from what the gain-corrected means still disagree by.
-  final gains = solveExposureGains(
+  // One multiplicative gain per frame **per channel**, propagated from the
+  // Middle Ring anchor across the neighbour graph (GainBlocks logic): each
+  // frame's median BGR in a genuine overlap is matched to an already-gained
+  // neighbour. Median resists outliers, per-channel absorbs white-balance
+  // drift, and [0.65, 1.45] bounds what "exposure difference" may explain.
+  final channelGains = solveChannelMedianGains(
     pixelCount: width * height,
     frameCount: records.length,
     bestFrame: bestFrame,
@@ -592,68 +676,42 @@ int resolveSphereStitchWidth(int requested) {
     secondWeight: secondWeight,
     bestColour: bestColour,
     secondColour: secondColour,
-  );
-  final offsets = solveExposureOffsets(
-    pixelCount: width * height,
-    frameCount: records.length,
-    bestFrame: bestFrame,
-    secondFrame: secondFrame,
-    bestWeight: bestWeight,
-    secondWeight: secondWeight,
-    bestColour: bestColour,
-    secondColour: secondColour,
-    gains: gains,
+    minWeight: _kMinPixelWeight,
   );
 
   final exposureMs = lapMs();
 
-  // ── Feathering ──────────────────────────────────────────────────────
+  // ── Seam compositing ────────────────────────────────────────────────
   //
-  // This replaces "the nearest photograph wins, blended only where the top two
-  // weights are within 3%". That rule was the visible seam: at 3% the transition
-  // is a few pixels wide, so the seam reads as a cut, and where two frames
-  // disagreed the cut tore.
+  // This replaces the normalised weighted average of the top two contributors
+  // over the whole overlap. Where two frames disagreed — and indoors they do,
+  // by 20-45 px of parallax on close objects — averaging drew the
+  // disagreement twice at ~50% opacity: the white wall showed through the
+  // wardrobe, the chair grew a second seat, the wall shelf doubled.
   //
-  // Now every pixel that two photographs both see is a normalised weighted
-  // average of the two, over the whole overlap rather than a hairline. The
-  // weights are already the right ones — they fall off toward a frame's edge and
-  // toward grazing angles — so the blend fades in and out exactly where each
-  // photograph stops being trustworthy. `detail::MultiBandBlender` is not
-  // exposed by dartcv4 2.2.2 either, and a pyramid built from Dart typed arrays
-  // at 4096×2048 would cost more memory than the whole accumulator; feathering
-  // the top two contributors is what removes the rectangular boundary and the
-  // hard step, and compositing from a less-reduced decode is what keeps the
-  // detail. Neither claim depends on the other.
+  // `compositeSeams` gives every pixel exactly one owner — a graph-cut seam
+  // routes the ownership boundary through content the frames agree on
+  // (plain wall) and around the objects they do not (chair, wardrobe,
+  // shelf, curtain) — and renders it at 100% opacity from that frame alone.
+  // The only cross-fade is a kSeamFeatherPx-pixel band strictly across the
+  // seam line; nothing averages over the wide overlap any more.
   final output = Uint8List(width * height * 3);
-  for (var i = 0; i < width * height; i++) {
-    final best = bestWeight[i];
-    if (best <= _kMinPixelWeight) continue;
-    final bestIndex = bestFrame[i];
-    final gainBest = bestIndex >= 0 ? gains[bestIndex] : 1.0;
-    final offsetBest = bestIndex >= 0 ? offsets[bestIndex] : 0.0;
-    final second = secondWeight[i];
-    final secondIndex = secondFrame[i];
-    if (second > _kMinPixelWeight && secondIndex >= 0) {
-      final total = best + second;
-      final t = best / total;
-      final gainSecond = gains[secondIndex];
-      final offsetSecond = offsets[secondIndex];
-      for (var c = 0; c < 3; c++) {
-        final value =
-            (bestColour[i * 3 + c] * gainBest + offsetBest) * t +
-            (secondColour[i * 3 + c] * gainSecond + offsetSecond) * (1 - t);
-        output[i * 3 + c] = value <= 0
-            ? 0
-            : (value >= 255 ? 255 : value.round());
-      }
-    } else {
-      for (var c = 0; c < 3; c++) {
-        final value = bestColour[i * 3 + c] * gainBest + offsetBest;
-        output[i * 3 + c] = value <= 0
-            ? 0
-            : (value >= 255 ? 255 : value.round());
-      }
-    }
+  final seamStats = compositeSeams(
+    output: output,
+    width: width,
+    height: height,
+    bestColour: bestColour,
+    secondColour: secondColour,
+    bestWeight: bestWeight,
+    secondWeight: secondWeight,
+    bestFrame: bestFrame,
+    secondFrame: secondFrame,
+    channelGains: channelGains,
+    minWeight: _kMinPixelWeight,
+    featherPx: kSeamFeatherPx,
+  );
+  if (kSphereStitchLog) {
+    debugPrint('SPHERE_SEAM: ${seamStats.toJson()}');
   }
 
   final blendMs = lapMs();
@@ -664,7 +722,8 @@ int resolveSphereStitchWidth(int requested) {
   // direction showed as a black disc rather than as a slightly soft patch. A
   // gap cannot be retried without recapturing, so the honest failure mode is a
   // smeared extrapolation plus a diagnostic that says "retake this direction" —
-  // not a hole in the product.
+  // not a hole in the product. The pole frames now use a 16% margin and the
+  // Nadir fades radially, so the small Zenith crescent is closed at source.
   final filledPixels = fillUncovered(
     output: output,
     bestWeight: bestWeight,
@@ -672,6 +731,33 @@ int resolveSphereStitchWidth(int requested) {
     height: height,
   );
   final fillMs = lapMs();
+
+  // ── Embed the feature-stitched band ─────────────────────────────────
+  //
+  // The pose projection above is complete but rotation-only: where the sensor
+  // prior drifted, close objects are duplicated across ownership seams no
+  // mask can hide. The feature-based Stitcher's output — attempted before the
+  // accumulator was allocated, so the two memory footprints never overlap —
+  // is blended over the equatorial band through a 40-px smoothstep gradient;
+  // the pole caps stay pose-projected. On any Stitcher failure this is a
+  // no-op and the pose projection remains the whole panorama.
+  var stitcherEmbedded = false;
+  final bandPano = stitchAttempt.pano;
+  if (bandPano != null) {
+    stitcherEmbedded = _embedStitcherBand(
+      output: output,
+      width: width,
+      height: height,
+      pano: bandPano,
+    );
+    debugPrint(
+      'FLUTTER_STITCH: stitcher band embedded='
+      '${stitcherEmbedded ? 'yes' : 'no'} pano=${bandPano.cols}x'
+      '${bandPano.rows} canvas=${width}x$height featherPx=40',
+    );
+  }
+  bandPano?.dispose();
+
   // ── Coverage audit ──────────────────────────────────────────────────
   //
   // Equirectangular rows are not equal-area: a row at latitude φ covers only
@@ -726,11 +812,7 @@ int resolveSphereStitchWidth(int requested) {
   // the viewer looks up. This measures what is seen: over a set of view
   // directions, the largest fraction of a 90° viewport that holds no
   // photograph at all.
-  final viewport = worstViewportGap(
-    hits: hits,
-    width: width,
-    height: height,
-  );
+  final viewport = worstViewportGap(hits: hits, width: width, height: height);
   if (kSphereStitchLog) {
     debugPrint(
       'SPHERE_STITCH: coverage single=${(single * 100).toStringAsFixed(2)}% '
@@ -772,8 +854,7 @@ int resolveSphereStitchWidth(int requested) {
     if (gapCells[cell] <= 0) continue;
     rankedGaps.add({
       'longitudeDeg': -180 + ((cell % gapCols) + 0.5) / gapCols * 360,
-      'latitudeDeg':
-          90 - ((cell ~/ gapCols) + 0.5) / gapRows * 180,
+      'latitudeDeg': 90 - ((cell ~/ gapCols) + 0.5) / gapRows * 180,
       'uncoveredAreaPercent': gapCells[cell] / totalArea * 100,
     });
   }
@@ -782,96 +863,118 @@ int resolveSphereStitchWidth(int requested) {
       a['uncoveredAreaPercent']! as double,
     ),
   );
-  final reportPath = p.join(
-    File(outPath).parent.path,
-    'coverage_report.json',
-  );
+  final reportPath = p.join(File(outPath).parent.path, 'coverage_report.json');
   final report = <String, Object?>{
-        'generatedAt': DateTime.now().toUtc().toIso8601String(),
-        'station': File(outPath).parent.path,
-        'panorama': {
-          'path': outPath,
-          'width': width,
-          'height': height,
-          'aspect': '2:1 equirectangular',
-        },
-        'photographCount': records.length,
-        'verticalFovAssumedDeg': kSphereAssumedVerticalFovDeg,
-        'resolution': {
-          'requestedWidth': requestedWidth,
-          'width': width,
-          'height': height,
-          'accumulatorBytes': sphereStitchAccumulatorBytes(width),
-          'budgetBytes': kSphereStitchAccumulatorBudgetBytes,
-          'downgraded': width != requestedWidth,
-        },
-        // Registration is the part that decides whether the seams are straight,
-        // so its own numbers belong next to the coverage numbers rather than only
-        // in the log: how many pairs were matched, how many produced a rotation
-        // worth trusting, and how far the worst frame was moved.
-        'registration': {
-          'enabled': args.refineRegistration,
-          'pairsConsidered': registration.pairsConsidered,
-          'acceptedEdges': registration.acceptedEdges,
-          'rejectedEdges': registration.rejectedEdges,
-          'featuresDetected': registration.featureTotal,
-          'maxCorrectionDeg': maxCorrectionDeg(registration.correctionDeg),
-          'perFrameCorrectionDeg': registration.correctionDeg,
-          if (registration.notes.isNotEmpty) 'notes': registration.notes,
-        },
-        // Measured, not estimated. A stage that gets slower shows up here.
-        'timingsMs': {
-          'registration': registrationMs,
-          'projection': projectionMs,
-          'exposure': exposureMs,
-          'blend': blendMs,
-          'gapFill': fillMs,
-          // Patched in after the encode, which happens below. `-1` here means the
-          // station was rejected before the encode was attempted.
-          'encode': -1,
-          'total': stopwatch.elapsedMilliseconds,
-        },
-        'thresholdPercent': 99.5,
-        'passed': single >= 0.995,
-        'coveragePercent': {
-          'single': single * 100,
-          'double': doubleCoverage * 100,
-          'triple': tripleCoverage * 100,
-        },
-        'uncoveredPercent': (1 - single) * 100,
-        'coverageMapPath': mapPath,
-        // The number that matches the user's experience. `uncoveredPercent`
-        // above is area-weighted and cannot see a polar hole; this is the worst
-        // 90° viewport, in which a polar hole is the most visible thing there is.
-        'worstViewportGapPercent': viewport.gap * 100,
-        'worstViewportGapDirection': {
-          'latitudeDeg': viewport.latitudeDeg,
-          'longitudeDeg': viewport.longitudeDeg,
-        },
-        'worstViewportGapThresholdPercent': 25.0,
-        'gapFilledPixels': filledPixels,
-        'exposureGains': <double>[
-          for (final gain in gains) double.parse(gain.toStringAsFixed(4)),
+    'generatedAt': DateTime.now().toUtc().toIso8601String(),
+    'station': File(outPath).parent.path,
+    'panorama': {
+      'path': outPath,
+      'width': width,
+      'height': height,
+      'aspect': '2:1 equirectangular',
+    },
+    'photographCount': records.length,
+    'verticalFovAssumedDeg': kSphereAssumedVerticalFovDeg,
+    'resolution': {
+      'requestedWidth': requestedWidth,
+      'width': width,
+      'height': height,
+      'accumulatorBytes': sphereStitchAccumulatorBytes(width),
+      'budgetBytes': kSphereStitchAccumulatorBudgetBytes,
+      'downgraded': width != requestedWidth,
+    },
+    // Registration is the part that decides whether the seams are straight,
+    // so its own numbers belong next to the coverage numbers rather than only
+    // in the log: how many pairs were matched, how many produced a rotation
+    // worth trusting, and how far the worst frame was moved.
+    'registration': {
+      'enabled': args.refineRegistration,
+      'pairsConsidered': registration.pairsConsidered,
+      'acceptedEdges': registration.acceptedEdges,
+      'rejectedEdges': registration.rejectedEdges,
+      'featuresDetected': registration.featureTotal,
+      'maxCorrectionDeg': maxCorrectionDeg(registration.correctionDeg),
+      'perFrameCorrectionDeg': registration.correctionDeg,
+      if (registration.notes.isNotEmpty) 'notes': registration.notes,
+    },
+    // Measured, not estimated. A stage that gets slower shows up here.
+    'timingsMs': {
+      'registration': registrationMs,
+      'projection': projectionMs,
+      'exposure': exposureMs,
+      'blend': blendMs,
+      'gapFill': fillMs,
+      'stitcherBand': stitcherMs,
+      // Patched in after the encode, which happens below. `-1` here means the
+      // station was rejected before the encode was attempted.
+      'encode': -1,
+      'total': stopwatch.elapsedMilliseconds,
+    },
+    'thresholdPercent': 99.5,
+    'passed': single >= 0.995,
+    'coveragePercent': {
+      'single': single * 100,
+      'double': doubleCoverage * 100,
+      'triple': tripleCoverage * 100,
+    },
+    'uncoveredPercent': (1 - single) * 100,
+    'coverageMapPath': mapPath,
+    // The number that matches the user's experience. `uncoveredPercent`
+    // above is area-weighted and cannot see a polar hole; this is the worst
+    // 90° viewport, in which a polar hole is the most visible thing there is.
+    'worstViewportGapPercent': viewport.gap * 100,
+    'worstViewportGapDirection': {
+      'latitudeDeg': viewport.latitudeDeg,
+      'longitudeDeg': viewport.longitudeDeg,
+    },
+    'worstViewportGapThresholdPercent': 25.0,
+    'gapFilledPixels': filledPixels,
+    // One bounded gain per frame per channel, indexed [frame][r,g,b] — the
+    // median-ratio colour match applied before seam compositing.
+    'colourGains': <List<double>>[
+      for (var f = 0; f < records.length; f++)
+        <double>[
+          double.parse(channelGains[f * 3].toStringAsFixed(3)),
+          double.parse(channelGains[f * 3 + 1].toStringAsFixed(3)),
+          double.parse(channelGains[f * 3 + 2].toStringAsFixed(3)),
         ],
-        if (single < 1)
-          'largestGap': {
-            'longitudeDeg': worstLon,
-            'latitudeDeg': worstLat,
+    ],
+    // What the seam pass did and how much disagreement it could not
+    // remove — the direct measure of whether ghosting survives.
+    'seamBlend': seamStats.toJson(),
+    // The feature-stitched equatorial band. When `embedded` is true the
+    // equatorial band comes from cv.Stitcher's bundle-adjusted, gain-
+    // compensated composite; the coverage numbers below describe the pose
+    // projection that filled the canvas before the band was applied and that
+    // still owns the pole caps.
+    'stitcher': {
+      'ok': stitcherEmbedded,
+      'status': stitchAttempt.status,
+      'panoSize': stitchAttempt.pano == null
+          ? ''
+          : '${stitchAttempt.pano!.cols}x${stitchAttempt.pano!.rows}',
+      'embedded': stitcherEmbedded,
+      'bandFeatherPx': 40,
+      'elapsedMs': stitcherMs,
+    },
+    if (single < 1)
+      'largestGap': {'longitudeDeg': worstLon, 'latitudeDeg': worstLat},
+    'uncoveredRegions': rankedGaps
+        .take(6)
+        .map(
+          (Map<String, Object?> region) => <String, Object?>{
+            'longitudeDeg': (region['longitudeDeg']! as double).toStringAsFixed(
+              1,
+            ),
+            'latitudeDeg': (region['latitudeDeg']! as double).toStringAsFixed(
+              1,
+            ),
+            'uncoveredAreaPercent': (region['uncoveredAreaPercent']! as double)
+                .toStringAsFixed(3),
           },
-        'uncoveredRegions': rankedGaps
-            .take(6)
-            .map(
-              (Map<String, Object?> region) => <String, Object?>{
-                'longitudeDeg':
-                    (region['longitudeDeg']! as double).toStringAsFixed(1),
-                'latitudeDeg':
-                    (region['latitudeDeg']! as double).toStringAsFixed(1),
-                'uncoveredAreaPercent': (region['uncoveredAreaPercent']! as double)
-                    .toStringAsFixed(3),
-              },
-            )
-            .toList(growable: false),
-      };
+        )
+        .toList(growable: false),
+  };
   // Written before the acceptance gates, deliberately: a station that fails is
   // exactly the one whose coverage map and gap list someone needs to read.
   try {
@@ -999,28 +1102,36 @@ int _lerp4(int c00, int c10, int c01, int c11, double du, double dv) =>
             c11 * du * dv)
         .round();
 
-/// Per-photograph exposure gains, estimated from the pixels two photographs
-/// both see.
+/// Per-photograph, per-channel colour gains, propagated from the anchor frame.
 ///
-/// Each frame is exposed by its own auto-exposure loop, so two photographs of
-/// the same white wall can differ by 10-20% in brightness. Blending them
-/// uncorrected puts a visible step along every seam, and a ceiling shows it
-/// worst because it is large, uniform and evenly lit — nothing else hides the
-/// step.
+/// Each frame is exposed and white-balanced by its own auto loop, so two
+/// photographs of the same wall can differ by 10-20% in brightness and a few
+/// percent per channel. Uncorrected, every seam is also a step — a bright
+/// curtain against a dark one reads as jagged stair-cases.
 ///
-/// For every pixel two photographs share, the model is
-/// `log(g_a) - log(g_b) = log(mean_a / mean_b)`. Logs are what make this
-/// linear: a gain is a multiplication, and multiplication is addition under a
-/// logarithm. That gives a small overdetermined system over the photographs,
-/// which Gauss-Seidel relaxation solves without a linear-algebra dependency.
+/// This is OpenCV's `detail::GainCompensator` idea with a median statistic:
+/// for every genuinely shared pixel the two frames' BGR values are
+/// histogrammed **per neighbour pair**. A breadth-first walk then starts at
+/// the anchor (frame 0, the first Middle Ring frame, gain 1) and propagates
+/// outward through the overlap graph, setting each neighbour's gain from the
+/// already-calibrated frame's median:
 ///
-/// The solution is normalised so the mean gain is 1 — only the *ratios* are
-/// observable, so without that the whole panorama would drift bright or dark.
-/// Gains are clamped to ±0.6 in log space (roughly 0.55× to 1.82×): a larger
-/// correction than that is a misregistration or a genuinely different scene,
-/// not an exposure difference, and applying it would wreck the image.
+/// ```
+/// gain[v][c] = clamp(gain[u][c] · median_u[c] / median_v[c], 0.65, 1.45)
+/// ```
+///
+/// Propagating rather than solving against one station-wide median is what
+/// lets a dark Zenith ceiling be matched to the ceiling tiles of the ring
+/// that actually touches it, and then the ring to the Middle Ring anchor,
+/// instead of dragging every frame toward a global average that no frame
+/// represents.
+///
+/// Medians resist blown windows and dark wardrobes; per-channel corrections
+/// absorb auto-white-balance drift; the clamp stops a disagreement about the
+/// scene from being "fixed" as exposure. A pair with too few shared samples
+/// contributes no edge — its frame keeps gain 1 rather than a guess.
 @visibleForTesting
-Float64List solveExposureGains({
+Float64List solveChannelMedianGains({
   required int pixelCount,
   required int frameCount,
   required Int16List bestFrame,
@@ -1029,177 +1140,98 @@ Float64List solveExposureGains({
   required Float32List secondWeight,
   required Uint8List bestColour,
   required Uint8List secondColour,
+  double minWeight = 0,
 }) {
-  final gains = Float64List(frameCount)..fillRange(0, frameCount, 1.0);
+  const double gainMin = 0.65;
+  const double gainMax = 1.45;
+  // Below this many shared samples a median is noise, not evidence.
+  const int minSamples = 48;
+
+  final gains = Float64List(frameCount * 3)..fillRange(0, frameCount * 3, 1.0);
   if (frameCount < 2) return gains;
 
-  final sumBest = Float64List(frameCount * frameCount);
-  final sumSecond = Float64List(frameCount * frameCount);
-  final counts = Float64List(frameCount * frameCount);
+  // Per-pair histograms: key = a * frameCount + b (a < b), value = two
+  // frames × three channels × 256 byte bins. 38 frames at worst is ~2.2 MB,
+  // bounded by the pairs that actually overlap rather than all 703 pairs.
+  final pairHist = <int, Int32List>{};
+  final pairSamples = <int, Int32List>{};
   for (var i = 0; i < pixelCount; i++) {
-    final a = bestFrame[i];
-    final b = secondFrame[i];
-    if (a < 0 || b < 0 || a == b) continue;
-    // Only pixels genuinely shared count. A sliver at a frame's edge carries
-    // the lens falloff, not the exposure difference — the same reason the
-    // projection weights those pixels toward zero.
+    final best = bestFrame[i];
+    final second = secondFrame[i];
+    if (best < 0 || second < 0 || best == second) continue;
+    // Grazing slivers carry lens falloff, not exposure information.
     if (secondWeight[i] < 0.35 * bestWeight[i]) continue;
-    final lumBest =
-        0.299 * bestColour[i * 3] +
-        0.587 * bestColour[i * 3 + 1] +
-        0.114 * bestColour[i * 3 + 2];
-    final lumSecond =
-        0.299 * secondColour[i * 3] +
-        0.587 * secondColour[i * 3 + 1] +
-        0.114 * secondColour[i * 3 + 2];
-    // Near-black pixels carry almost no exposure information and divide badly.
-    if (lumBest < 8 || lumSecond < 8) continue;
-    final k = a * frameCount + b;
-    sumBest[k] += lumBest;
-    sumSecond[k] += lumSecond;
-    counts[k] += 1;
-  }
-
-  // Collapse to one observation per ordered pair.
-  //
-  // The sign matters and is easy to get backwards. The goal is
-  // `gain_a·mean_a == gain_b·mean_b`, so `gain_a/gain_b == mean_b/mean_a` —
-  // the *reciprocal* of the brightness ratio. Using the brightness ratio
-  // directly would brighten the already-bright frame and double the step it was
-  // meant to remove.
-  final pairA = <int>[];
-  final pairB = <int>[];
-  final pairRatio = <double>[];
-  for (var a = 0; a < frameCount; a++) {
-    for (var b = 0; b < frameCount; b++) {
-      final k = a * frameCount + b;
-      if (counts[k] < 24) continue;
-      final gainRatio = sumSecond[k] / sumBest[k];
-      if (gainRatio <= 0.05 || gainRatio >= 20) continue;
-      pairA.add(a);
-      pairB.add(b);
-      pairRatio.add(math.log(gainRatio));
+    final key = best < second
+        ? best * frameCount + second
+        : second * frameCount + best;
+    final hist = pairHist.putIfAbsent(key, () => Int32List(2 * 3 * 256));
+    final samples = pairSamples.putIfAbsent(key, () => Int32List(2 * 3));
+    final bestSlot = best < second ? 0 : 1;
+    final secondSlot = 1 - bestSlot;
+    for (var c = 0; c < 3; c++) {
+      final bestValue = bestColour[i * 3 + c];
+      final secondValue = secondColour[i * 3 + c];
+      hist[(bestSlot * 3 + c) * 256 + bestValue]++;
+      samples[bestSlot * 3 + c]++;
+      hist[(secondSlot * 3 + c) * 256 + secondValue]++;
+      samples[secondSlot * 3 + c]++;
     }
   }
-  if (pairA.isEmpty) return gains;
+  if (pairHist.isEmpty) return gains;
 
-  final logGain = Float64List(frameCount);
-  // A frame with no overlap keeps logGain 0, i.e. gain 1 — it is left alone
-  // rather than dragged by a graph it is not connected to.
-  for (var pass = 0; pass < 160; pass++) {
-    for (var p = 0; p < pairA.length; p++) {
-      final a = pairA[p];
-      final b = pairB[p];
-      final error = pairRatio[p] - (logGain[a] - logGain[b]);
-      final step = 0.08 * error;
-      logGain[a] += step;
-      logGain[b] -= step;
+  // Value where the cumulative count first reaches half.
+  int median(Int32List hist, int offset, int total) {
+    final target = (total + 1) ~/ 2;
+    var cumulative = 0;
+    for (var v = 0; v < 256; v++) {
+      cumulative += hist[offset + v];
+      if (cumulative >= target) return v;
     }
+    return 255;
   }
 
-  var mean = 0.0;
-  for (var i = 0; i < frameCount; i++) {
-    mean += logGain[i];
+  // Undirected overlap graph, built from the pair histograms.
+  final neighbours = List<List<int>>.generate(frameCount, (_) => <int>[]);
+  for (final key in pairHist.keys) {
+    final a = key ~/ frameCount;
+    final b = key % frameCount;
+    neighbours[a].add(b);
+    neighbours[b].add(a);
   }
-  mean /= frameCount;
-  for (var i = 0; i < frameCount; i++) {
-    final corrected = (logGain[i] - mean).clamp(-0.6, 0.6);
-    gains[i] = math.exp(corrected);
+
+  // Breadth-first from the anchor: every frame is calibrated against a
+  // neighbour that is already calibrated, so error cannot be handed to both
+  // sides of a pair in opposite directions.
+  final settled = List<bool>.filled(frameCount, false);
+  settled[0] = true;
+  final queue = <int>[0];
+  for (var head = 0; head < queue.length; head++) {
+    final u = queue[head];
+    for (final v in neighbours[u]) {
+      if (settled[v]) continue;
+      settled[v] = true;
+      final key = u < v ? u * frameCount + v : v * frameCount + u;
+      final hist = pairHist[key]!;
+      final samples = pairSamples[key]!;
+      final uSlot = u < v ? 0 : 1;
+      final vSlot = 1 - uSlot;
+      for (var c = 0; c < 3; c++) {
+        final uSamples = samples[uSlot * 3 + c];
+        final vSamples = samples[vSlot * 3 + c];
+        if (uSamples < minSamples || vSamples < minSamples) continue;
+        final uMedian = median(hist, (uSlot * 3 + c) * 256, uSamples);
+        final vMedian = median(hist, (vSlot * 3 + c) * 256, vSamples);
+        // Near-black overlaps carry no exposure information and divide badly.
+        if (uMedian < 1 || vMedian < 1) continue;
+        final raw = gains[u * 3 + c] * uMedian / vMedian;
+        gains[v * 3 + c] = raw < gainMin
+            ? gainMin
+            : (raw > gainMax ? gainMax : raw);
+      }
+      queue.add(v);
+    }
   }
   return gains;
-}
-
-/// Per-photograph exposure offsets, solved after [solveExposureGains].
-///
-/// A gain alone cannot level a seam where the camera also moved its black point:
-/// a window that blew out one frame lifts the whole frame, and scaling that frame
-/// down darkens its walls instead of matching them. The offset absorbs the rest.
-///
-/// The model is `corrected = gain·I + offset`, and the target is
-/// `gain_a·L_a + offset_a == gain_b·L_b + offset_b` over the pixels two frames
-/// share. With the gains already fixed, that is one linear equation per pair —
-/// `offset_a − offset_b = M_b − M_a` where `M = gain·L` — solved by the same
-/// Gauss-Seidel relaxation as the gains, then centred so the panorama does not
-/// drift.
-///
-/// Offsets are clamped to ±40 of 255. Beyond that the two frames are not the same
-/// scene under different exposure; they are different content, and forcing them
-/// level would flatten a genuinely dark corner.
-@visibleForTesting
-Float64List solveExposureOffsets({
-  required int pixelCount,
-  required int frameCount,
-  required Int16List bestFrame,
-  required Int16List secondFrame,
-  required Float32List bestWeight,
-  required Float32List secondWeight,
-  required Uint8List bestColour,
-  required Uint8List secondColour,
-  required Float64List gains,
-}) {
-  final offsets = Float64List(frameCount);
-  if (frameCount < 2) return offsets;
-
-  final sumBest = Float64List(frameCount * frameCount);
-  final sumSecond = Float64List(frameCount * frameCount);
-  final counts = Float64List(frameCount * frameCount);
-  for (var i = 0; i < pixelCount; i++) {
-    final a = bestFrame[i];
-    final b = secondFrame[i];
-    if (a < 0 || b < 0 || a == b) continue;
-    if (secondWeight[i] < 0.35 * bestWeight[i]) continue;
-    final lumBest =
-        0.299 * bestColour[i * 3] +
-        0.587 * bestColour[i * 3 + 1] +
-        0.114 * bestColour[i * 3 + 2];
-    final lumSecond =
-        0.299 * secondColour[i * 3] +
-        0.587 * secondColour[i * 3 + 1] +
-        0.114 * secondColour[i * 3 + 2];
-    if (lumBest < 8 || lumSecond < 8) continue;
-    final k = a * frameCount + b;
-    sumBest[k] += lumBest;
-    sumSecond[k] += lumSecond;
-    counts[k] += 1;
-  }
-
-  final pairA = <int>[];
-  final pairB = <int>[];
-  final pairResidual = <double>[];
-  for (var a = 0; a < frameCount; a++) {
-    for (var b = 0; b < frameCount; b++) {
-      final k = a * frameCount + b;
-      if (counts[k] < 24) continue;
-      final correctedBest = gains[a] * (sumBest[k] / counts[k]);
-      final correctedSecond = gains[b] * (sumSecond[k] / counts[k]);
-      // We want corrected_a + offset_a == corrected_b + offset_b.
-      pairA.add(a);
-      pairB.add(b);
-      pairResidual.add(correctedSecond - correctedBest);
-    }
-  }
-  if (pairA.isEmpty) return offsets;
-
-  for (var pass = 0; pass < 160; pass++) {
-    for (var p = 0; p < pairA.length; p++) {
-      final a = pairA[p];
-      final b = pairB[p];
-      final error = pairResidual[p] - (offsets[a] - offsets[b]);
-      final step = 0.08 * error;
-      offsets[a] += step;
-      offsets[b] -= step;
-    }
-  }
-
-  var mean = 0.0;
-  for (var i = 0; i < frameCount; i++) {
-    mean += offsets[i];
-  }
-  mean /= frameCount;
-  for (var i = 0; i < frameCount; i++) {
-    offsets[i] = (offsets[i] - mean).clamp(-40.0, 40.0);
-  }
-  return offsets;
 }
 
 /// Fills every pixel no photograph reached, by propagating colour outward from
@@ -1376,7 +1408,8 @@ void _smoothRegion(
   required int width,
   required int height,
 }) {
-  const sampleCount = 6000;  const viewCount = 300;
+  const sampleCount = 6000;
+  const viewCount = 300;
   // cos(45°) — a 90° viewport, which is wider than the viewer's default.
   const halfFovCos = 0.7071067811865476;
 
@@ -1452,24 +1485,45 @@ double _clampDouble(double value, double min, double max) =>
 int _clampInt(int value, int min, int max) =>
     value < min ? min : (value > max ? max : value);
 
-/// Runs OpenCV's ring-first stitcher explicitly for diagnostics.
+/// The decode target for the ring frames passed to the Stitcher.
 ///
-/// The 38-target spherical output still needs the known-pose renderer because
-/// Stitcher returns a flat panorama and has no Zenith/Nadir equirectangular
-/// contract. This attempt makes any OpenCV failure visible instead of silently
-/// implying that it produced the saved spherical JPEG.
-Future<void> _diagnoseOpenCvRingPath(List<String> imagePaths) async {
-  final ringPaths = <String>[
-    ...imagePaths.take(12),
-    ...imagePaths.skip(13).take(24),
-  ];
+/// 36 frames at 720×960 cost about 75 MB of decoded pixels — roughly a quarter
+/// of what full-resolution decodes would need — which is what keeps the
+/// Stitcher's internal copies inside a phone's budget. The shorter side is
+/// fixed at 720 and the longer side follows the source aspect, so a landscape
+/// source is handled by the same rule.
+const int _kStitcherShortSidePx = 720;
+
+/// Runs OpenCV's feature-based Stitcher over the 36 ring frames.
+///
+/// This is the **production** equatorial-band source, not a diagnostic: when it
+/// returns a panorama, that panorama is embedded over the pose-projected band
+/// by [_embedStitcherBand]. The zenith (target 13 → record index 12) and nadir
+/// (target 38 → index 37) shots are excluded — a featureless white ceiling
+/// gives the matcher nothing, and one bad frame aborts the whole stitch with
+/// `ERR_NEED_MORE_IMGS`. Every failure is logged and non-fatal: the pose
+/// projection remains the complete fallback.
+({cv.Mat? pano, String status}) _stitchRingWithOpenCv({
+  required List<Map<String, dynamic>> records,
+  required void Function(String) progress,
+}) {
+  final ringPaths = <String>[];
+  for (var i = 0; i < records.length; i++) {
+    // Exclude the poles by record order (sorted by targetId): index 12 is the
+    // zenith, index 37 the nadir — the same 36 the old diagnostic selected.
+    if (i == 12 || i == 37) continue;
+    final path = records[i]['imagePath'] as String?;
+    if (path == null || !File(path).existsSync()) continue;
+    ringPaths.add(path);
+  }
   if (ringPaths.length != 36) {
     debugPrint(
       'FLUTTER_STITCH: OPENCV_STITCHER ring-first skipped — '
       'expected 36 ring frames, got ${ringPaths.length}',
     );
-    return;
+    return (pano: null, status: 'skipped');
   }
+
   final mats = <cv.Mat>[];
   cv.Stitcher? stitcher;
   cv.Mat? pano;
@@ -1479,27 +1533,57 @@ Future<void> _diagnoseOpenCvRingPath(List<String> imagePaths) async {
       final source = cv.imread(path, flags: cv.IMREAD_COLOR);
       if (source.isEmpty) {
         debugPrint('FLUTTER_STITCH: OPENCV_STITCHER ring decode failed: $path');
-        source.dispose();
-        return;
+        return (pano: null, status: 'decode-failed');
       }
-      final resized = cv.resize(source, (960, 1280), interpolation: cv.INTER_LINEAR);
+      // Short side 720, longer side follows the source aspect (3:4 portrait
+      // sources decode to exactly 720×960).
+      final scale = _kStitcherShortSidePx / math.min(source.cols, source.rows);
+      final targetWidth = (source.cols * scale).round();
+      final targetHeight = (source.rows * scale).round();
+      final resized = cv.resize(source, (
+        targetWidth,
+        targetHeight,
+      ), interpolation: cv.INTER_AREA);
       source.dispose();
       mats.add(resized);
     }
+    progress(
+      'Matching ${mats.length} ring frames with OpenCV (720-class '
+      'decode, confidence 0.35)…',
+    );
     stitcher = cv.Stitcher.create(mode: cv.StitcherMode.PANORAMA)
-      ..panoConfidenceThresh = 0.4;
+      ..panoConfidenceThresh = 0.35;
     final input = cv.VecMat.fromList(mats);
     final result = stitcher.stitch(input);
     final status = result.$1;
     pano = result.$2;
+    if (status != cv.StitcherStatus.OK || pano.isEmpty) {
+      // The exact status code the caller asked for, verbatim, plus the same
+      // context line the old diagnostic printed.
+      debugPrint('STITCHER_FAILED_STATUS: $status');
+      debugPrint(
+        'FLUTTER_STITCH: OPENCV_STITCHER ring-first frames=${mats.length} '
+        'input=720-class confidence=0.35 status=${status.name}'
+        '(${status.index}) elapsedMs=${watch.elapsedMilliseconds} '
+        'pano=${pano.isEmpty ? 'empty' : '${pano.cols}x${pano.rows}'} — '
+        'pose projection remains the panorama.',
+      );
+      pano.dispose();
+      pano = null; // disposed; the finally block must not double-free
+      return (pano: null, status: status.name);
+    }
     debugPrint(
       'FLUTTER_STITCH: OPENCV_STITCHER ring-first frames=${mats.length} '
-      'input=960x1280 confidence=0.4 status=${status.name}(${status.index}) '
-      'elapsedMs=${watch.elapsedMilliseconds} '
-      'pano=${pano.isEmpty ? 'empty' : '${pano.cols}x${pano.rows}'}',
+      'input=720-class confidence=0.35 status=${status.name}'
+      '(${status.index}) elapsedMs=${watch.elapsedMilliseconds} '
+      'pano=${pano.cols}x${pano.rows}',
     );
+    final stitched = pano;
+    pano = null; // ownership moves to the caller
+    return (pano: stitched, status: status.name);
   } catch (error) {
     debugPrint('FLUTTER_STITCH: OPENCV_STITCHER ring-first exception: $error');
+    return (pano: null, status: 'exception');
   } finally {
     pano?.dispose();
     stitcher?.dispose();
@@ -1507,4 +1591,190 @@ Future<void> _diagnoseOpenCvRingPath(List<String> imagePaths) async {
       mat.dispose();
     }
   }
+}
+
+/// The vertical feather, in pixels, at each edge of the embedded band.
+const double _kStitcherBandFeatherPx = 40;
+
+/// Embeds the Stitcher's panorama over the pose-projected equatorial band.
+///
+/// The Stitcher output is a spherical-warper patch: x is linear in longitude
+/// and y is linear in polar angle, so the patch is itself an equirectangular
+/// rectangle. A complete ring spans 360° of longitude, which fixes the patch's
+/// focal at `W / 2π`, and the vertical span follows from its own height:
+/// `latSpan = 2π · H / W`. The band is placed symmetric about the horizon —
+/// the ring layout (0°, ±35°) is symmetric, so the Stitcher's vertical union
+/// is too — and the two sources are cross-faded through a
+/// [_kStitcherBandFeatherPx] smoothstep gradient at each edge. The pole caps
+/// above and below the band remain the pose projection's.
+///
+/// The horizontal origin of the Stitcher output (its bounding box starts near
+/// the first frame's left edge, not at the pose projection's longitude −180°)
+/// is recovered by a one-dimensional circular cross-correlation of the two
+/// sources' column luminance over the band — without it, the band and the
+/// pole caps would disagree by tens of pixels exactly at the feather.
+///
+/// Returns whether the band was applied. A guard rejects patches whose aspect
+/// contradicts the full-ring assumption (the band would be misplaced or
+/// stretched); the pose projection then stands unchanged.
+bool _embedStitcherBand({
+  required Uint8List output,
+  required int width,
+  required int height,
+  required cv.Mat pano,
+}) {
+  final aspect = pano.cols / pano.rows;
+  // A full ring of 65°-FOV cameras across 0°/±35° rings covers roughly
+  // 105–150° of latitude, i.e. aspect 2.4–3.4. Anything outside 2.0–4.6 means
+  // the "full ring" premise is wrong (frames were dropped or the output is
+  // something else entirely) and embedding would misplace the band.
+  if (aspect < 2.0 || aspect > 4.6) {
+    debugPrint(
+      'FLUTTER_STITCH: stitcher band rejected — aspect='
+      '${aspect.toStringAsFixed(2)} is outside the full-ring range 2.0..4.6; '
+      'pose projection stands.',
+    );
+    return false;
+  }
+  final latSpan = 2 * math.pi / aspect; // radians, ≤ π by the guard
+  final scaledHeight = math.max(1, (width / aspect).round());
+  final scaled = cv.resize(pano, (
+    width,
+    scaledHeight,
+  ), interpolation: cv.INTER_LINEAR);
+  try {
+    // `clamp` returns `num`, which would poison every row index below with
+    // `num` — clamp manually to keep the types int.
+    final topRaw = ((0.5 - latSpan / 2 / math.pi) * height).round();
+    final topLimit = math.max(0, height - scaledHeight);
+    final topRow = topRaw < 0 ? 0 : math.min(topRaw, topLimit);
+    final bottomRow = math.min(height, topRow + scaledHeight);
+    if (bottomRow - topRow < _kStitcherBandFeatherPx * 3) {
+      debugPrint(
+        'FLUTTER_STITCH: stitcher band rejected — band '
+        '${bottomRow - topRow}px is too small to feather; pose projection '
+        'stands.',
+      );
+      return false;
+    }
+
+    // ── Horizontal auto-alignment ────────────────────────────────────────
+    // Column-mean luminance of both sources over the band's middle half, then
+    // the circular shift that maximises their normalised correlation. This
+    // absorbs the Stitcher's unknown longitude origin in one O(W²) pass
+    // (~4M multiply-adds, tens of milliseconds).
+    final halfBand = (bottomRow - topRow) ~/ 2;
+    final sampleTop = topRow + halfBand ~/ 2;
+    final sampleBottom = sampleTop + halfBand;
+    final poseSignal = Float64List(width);
+    final panoSignal = Float64List(width);
+    final panoPixels = scaled.data;
+    final panoStride = width * 3;
+    var sampleCount = 0;
+    for (var y = sampleTop; y < sampleBottom; y += 4) {
+      final poseRow = y * width * 3;
+      final panoRow = (y - topRow) * panoStride;
+      for (var x = 0; x < width; x++) {
+        poseSignal[x] +=
+            0.299 * output[poseRow + x * 3] +
+            0.587 * output[poseRow + x * 3 + 1] +
+            0.114 * output[poseRow + x * 3 + 2];
+        panoSignal[x] +=
+            0.299 * panoPixels[panoRow + x * 3] +
+            0.587 * panoPixels[panoRow + x * 3 + 1] +
+            0.114 * panoPixels[panoRow + x * 3 + 2];
+      }
+      sampleCount++;
+    }
+    if (sampleCount == 0) return false;
+    final shift = _estimateBandShift(poseSignal, panoSignal, width);
+    debugPrint(
+      'FLUTTER_STITCH: stitcher band shift=${shift}px '
+      '($sampleCount sample rows, band rows $topRow..$bottomRow)',
+    );
+
+    // ── Blend ────────────────────────────────────────────────────────────
+    for (var y = topRow; y < bottomRow; y++) {
+      final fromTop = (y - topRow).toDouble();
+      final fromBottom = (bottomRow - 1 - y).toDouble();
+      var w = 1.0;
+      if (fromTop < _kStitcherBandFeatherPx) {
+        w = math.min(w, fromTop / _kStitcherBandFeatherPx);
+      }
+      if (fromBottom < _kStitcherBandFeatherPx) {
+        w = math.min(w, fromBottom / _kStitcherBandFeatherPx);
+      }
+      // Smoothstep: the linear ramp's derivative step is itself visible on a
+      // flat wall.
+      final t = w * w * (3 - 2 * w);
+      final poseRow = y * width * 3;
+      final panoRow = (y - topRow) * panoStride;
+      for (var x = 0; x < width; x++) {
+        // Circular shift: pano column (x - shift) mod width feeds canvas x.
+        var sx = x - shift;
+        if (sx < 0) sx += width;
+        final poseBase = poseRow + x * 3;
+        final panoBase = panoRow + sx * 3;
+        for (var c = 0; c < 3; c++) {
+          final poseValue = output[poseBase + c];
+          final panoValue = panoPixels[panoBase + c];
+          output[poseBase + c] = (poseValue + (panoValue - poseValue) * t)
+              .round();
+        }
+      }
+    }
+    return true;
+  } finally {
+    scaled.dispose();
+  }
+}
+
+/// The circular shift, in pixels, that best aligns [panoSignal] to
+/// [poseSignal]: the `d` maximising `Σ poseSignal[(x + d) mod width] ·
+/// panoSignal[x]` over zero-mean, unit-variance signals.
+///
+/// Both signals are column-mean luminances over the same latitude rows, so a
+/// well-aligned pair correlates strongly and noise floors near zero mean.
+int _estimateBandShift(
+  Float64List poseSignal,
+  Float64List panoSignal,
+  int width,
+) {
+  void normalise(Float64List signal) {
+    var mean = 0.0;
+    for (final v in signal) {
+      mean += v;
+    }
+    mean /= width;
+    var variance = 0.0;
+    for (var i = 0; i < width; i++) {
+      final d = signal[i] - mean;
+      signal[i] = d;
+      variance += d * d;
+    }
+    final std = math.sqrt(variance / width);
+    if (std > 1e-9) {
+      for (var i = 0; i < width; i++) {
+        signal[i] /= std;
+      }
+    }
+  }
+
+  normalise(poseSignal);
+  normalise(panoSignal);
+  var bestShift = 0;
+  var bestScore = -double.infinity;
+  for (var d = 0; d < width; d++) {
+    var score = 0.0;
+    for (var x = 0; x < width; x++) {
+      var px = x + d;
+      if (px >= width) px -= width;
+      score += poseSignal[px] * panoSignal[x];
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestShift = d;
+    }
+  }
+  return bestShift;
 }

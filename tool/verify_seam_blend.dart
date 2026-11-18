@@ -122,9 +122,7 @@ void main() {
       bestFrame[i] = aIsBest ? 0 : 1;
       secondFrame[i] = aIsBest ? 1 : 0;
       for (var c = 0; c < 3; c++) {
-        bestColour[i * 3 + c] = aIsBest
-            ? frameA[i * 3 + c]
-            : frameB[i * 3 + c];
+        bestColour[i * 3 + c] = aIsBest ? frameA[i * 3 + c] : frameB[i * 3 + c];
         secondColour[i * 3 + c] = aIsBest
             ? frameB[i * 3 + c]
             : frameA[i * 3 + c];
@@ -132,64 +130,72 @@ void main() {
     }
   }
 
-  scenario('1. parallax ghosting: averaging smears, seam selection does not',
-      () {
-    final averaged = weightedAverage(
-      a: frameA,
-      b: frameB,
-      wA: Float32List.fromList(<double>[
-        for (var i = 0; i < kWidth * kHeight; i++) i % kWidth < 32 ? 1.0 : 0.2,
-      ]),
-      wB: Float32List.fromList(<double>[
-        for (var i = 0; i < kWidth * kHeight; i++) i % kWidth < 32 ? 0.2 : 1.0,
-      ]),
-    );
-    final averagePartial = partialColumns(columnMeans(averaged));
+  scenario(
+    '1. parallax ghosting: averaging smears, seam selection does not',
+    () {
+      final averaged = weightedAverage(
+        a: frameA,
+        b: frameB,
+        wA: Float32List.fromList(<double>[
+          for (var i = 0; i < kWidth * kHeight; i++)
+            i % kWidth < 32 ? 1.0 : 0.2,
+        ]),
+        wB: Float32List.fromList(<double>[
+          for (var i = 0; i < kWidth * kHeight; i++)
+            i % kWidth < 32 ? 0.2 : 1.0,
+        ]),
+      );
+      final averagePartial = partialColumns(columnMeans(averaged));
 
-    final output = Uint8List(kWidth * kHeight * 3);
-    final stats = compositeSeams(
-      output: output,
-      width: kWidth,
-      height: kHeight,
-      bestColour: bestColour,
-      secondColour: secondColour,
-      bestWeight: bestWeight,
-      secondWeight: secondWeight,
-      bestFrame: bestFrame,
-      secondFrame: secondFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
-      minWeight: 0.001,
-    );
-    final seamPartial = partialColumns(columnMeans(output));
+      final output = Uint8List(kWidth * kHeight * 3);
+      final stats = compositeSeams(
+        output: output,
+        width: kWidth,
+        height: kHeight,
+        bestColour: bestColour,
+        secondColour: secondColour,
+        bestWeight: bestWeight,
+        secondWeight: secondWeight,
+        bestFrame: bestFrame,
+        secondFrame: secondFrame,
+        channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        minWeight: 0.001,
+      );
+      final seamPartial = partialColumns(columnMeans(output));
 
-    check(
-      'averaging leaves the object at half strength twice',
-      averagePartial == 8,
-      '$averagePartial partially-covered columns',
-    );
-    // With a 9 px feather the seam softens the object's own edges where it runs
-    // close to them, so a few partial columns are expected — but far fewer than
-    // averaging, which draws the object twice at half strength.
-    check(
-      'seam selection leaves far fewer than averaging',
-      seamPartial <= 4 && seamPartial < averagePartial,
-      '$seamPartial partially-covered columns vs $averagePartial for averaging',
-    );
-    check(
-      'the overlap was actually measured',
-      stats.overlapPixels == kWidth * kHeight,
-      '${stats.overlapPixels} px',
-    );
-    check('the second band was used', stats.usedSecondBand);
-    check('the graph cut ran', stats.cutUsed);
-    closeTo(
-      'no visible step across the seam',
-      stats.seamDiscontinuity,
-      0,
-      1.0,
-    );
-  });
+      check(
+        'averaging leaves the object at half strength twice',
+        averagePartial == 8,
+        '$averagePartial partially-covered columns',
+      );
+      // With the mandated 41-px Gaussian feather on a 64-px-wide test canvas,
+      // the transition itself spans a large part of the image, so counting
+      // "partial" columns no longer measures ghosting. What matters is that the
+      // object's shared core is drawn at full strength (one frame, 100% opaque)
+      // instead of twice at half strength the way averaging draws it.
+      final seamMeans = columnMeans(output);
+      final solidObjectColumns = seamMeans.where((double v) => v <= 62).length;
+      check(
+        'seam selection draws the shared core solid, averaging does not',
+        solidObjectColumns >= 4,
+        '$solidObjectColumns solid columns; averaging has 0 '
+            '($averagePartial partial columns)',
+      );
+      check(
+        'the overlap was actually measured',
+        stats.overlapPixels == kWidth * kHeight,
+        '${stats.overlapPixels} px',
+      );
+      check('the second band was used', stats.usedSecondBand);
+      check('the graph cut ran', stats.cutUsed);
+      closeTo(
+        'no visible step across the seam',
+        stats.seamDiscontinuity,
+        0,
+        1.0,
+      );
+    },
+  );
 
   scenario('2. identical frames: the composite is a byte-exact copy', () {
     final flat = Uint8List(kWidth * kHeight * 3);
@@ -207,8 +213,7 @@ void main() {
       secondWeight: secondWeight,
       bestFrame: bestFrame,
       secondFrame: secondFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
     var identical = true;
@@ -235,8 +240,7 @@ void main() {
       secondWeight: secondWeight,
       bestFrame: bestFrame,
       secondFrame: secondFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
     final columns = columnMeans(output);
@@ -268,8 +272,7 @@ void main() {
       secondWeight: secondWeight,
       bestFrame: bestFrame,
       secondFrame: secondFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
     closeTo('mean disagreement is reported', stats.ghostEnergy, 50, 0.5);
@@ -298,11 +301,11 @@ void main() {
       secondWeight: none,
       bestFrame: bestFrame,
       secondFrame: secondFrame,
-      gains: <double>[0.5, 1.0],
-      offsets: <double>[10.0, 0.0],
+      // Frame 0 dimmed to 60% across all three channels.
+      channelGains: <double>[0.6, 0.6, 0.6, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
-    check('output is 0.5 x 100 + 10', output[0] == 60, '${output[0]}');
+    check('output is 0.6 x 100', output[0] == 60, '${output[0]}');
     check('no second band built', !stats.usedSecondBand);
     check('no overlap measured', stats.overlapPixels == 0);
   });
@@ -352,8 +355,7 @@ void main() {
       secondWeight: wSecond,
       bestFrame: bFrame,
       secondFrame: sFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 
@@ -370,8 +372,7 @@ void main() {
     // legitimate 120-level step, and hiding it would mean discarding real
     // content. What must not happen is the blob being split across the seam,
     // which would draw it twice at partial strength.
-    final blobColumns =
-        columns.where((double v) => v < 90).length;
+    final blobColumns = columns.where((double v) => v < 90).length;
     // The seam may sit within the feather band of the object's edge, which
     // softens that edge — a 6 px transition, not a second copy. The property
     // that must hold is that the object is **not duplicated**: no more dark
@@ -402,7 +403,8 @@ void main() {
     }
 
     final none = Float32List(kWidth * kHeight);
-    final w = Float32List(kWidth * kHeight)..fillRange(0, kWidth * kHeight, 1.0);
+    final w = Float32List(kWidth * kHeight)
+      ..fillRange(0, kWidth * kHeight, 1.0);
     final frames = Int16List(kWidth * kHeight);
 
     SeamBlendStats run(Uint8List content) {
@@ -417,8 +419,7 @@ void main() {
         secondWeight: none,
         bestFrame: frames,
         secondFrame: frames,
-        gains: <double>[1.0, 1.0],
-        offsets: <double>[0.0, 0.0],
+        channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         minWeight: 0.001,
       );
     }
@@ -492,16 +493,17 @@ void main() {
       secondWeight: wSecond,
       bestFrame: bFrame,
       secondFrame: sFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
     compositeWatch.stop();
 
     check('cut produced labels', cut != null);
     check('composite ran the cut', stats.cutUsed);
-    print('  INFO  graph cut: ${cutWatch.elapsedMilliseconds} ms, '
-        'full composite: ${compositeWatch.elapsedMilliseconds} ms');
+    print(
+      '  INFO  graph cut: ${cutWatch.elapsedMilliseconds} ms, '
+      'full composite: ${compositeWatch.elapsedMilliseconds} ms',
+    );
     check(
       'full-size composite stays inside a usable budget',
       compositeWatch.elapsedMilliseconds < 20000,
@@ -649,8 +651,7 @@ void main() {
       secondWeight: wSecond,
       bestFrame: bFrame,
       secondFrame: sFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 
@@ -660,9 +661,7 @@ void main() {
       final step = (columns[x + 1] - columns[x]).abs();
       if (step > worstStep) worstStep = step;
     }
-    final midtones = columns
-        .where((double v) => v > 125 && v < 155)
-        .length;
+    final midtones = columns.where((double v) => v > 125 && v < 155).length;
 
     check(
       'no hard cut-line at the seam',

@@ -33,10 +33,11 @@
 ///    is exactly what this search does, with the whole neighbourhood evaluated
 ///    instead of one greedy flip.
 ///
-/// 3. **Multi-band blending.** A boundary is invisible only if both sides are
-///    identical; they never are. The transition is blended in two frequency
-///    bands — a coarse band over a wide mask, a fine band over a narrow one —
-///    which is a two-level Laplacian-pyramid blend. Full
+/// 3. **Narrow feather.** A boundary is invisible only if both sides are
+///    identical; they never are. The transition is cross-faded over a narrow
+///    band of [kSeamFeatherPx] pixels per side of the seam, and the ramp
+///    reaches **pure owner** at the band's edge — so every object is drawn
+///    once, at 100% opacity, from a single frame. Full
 ///    `detail::MultiBandBlender` is not exposed by dartcv4 2.2.2, and a Dart
 ///    pyramid at 4096×2048 would cost more memory than the accumulator itself.
 ///
@@ -72,6 +73,27 @@ const double kSeamCostWeight = 2.0;
 /// 24/255 is roughly 9% of full scale: below it the eye reads texture, above it
 /// the eye reads a second edge. Used only for reporting, never for compositing.
 const double kGhostVisibleDelta = 24.0;
+
+/// Feather half-width, in pixels, applied strictly across an ownership
+/// boundary.
+///
+/// Twenty pixels per side — a 41-pixel support, Gaussian σ=12 profile — is
+/// what a now-rotation-aligned, gain-matched pair needs for its boundary to
+/// disappear. The earlier 5-pixel feather left visible steps because the two
+/// frames still disagreed geometrically; widening it was unsafe then. With
+/// alignment solid, the cross-fade is wide enough to hide the rectangular
+/// wall/ceiling borders while still confining any 50/50 mixing to a thin
+/// strip instead of the whole overlap (which is what ghosted the wardrobe).
+const int kSeamFeatherPx = 20;
+
+/// Sigma of the Gaussian profile used across the ownership seam.
+///
+/// Paired with [kSeamFeatherPx] this is the equivalent of blurring each
+/// binary owner mask with `cv.GaussianBlur(Size(41, 41), 12.0)` and
+/// normalising the two weights — without allocating a second 6 MB mask over
+/// the canvas. The cumulative Gaussian is evaluated from the chamfer
+/// distance to the seam, which is already computed for the edge map.
+const double kSeamGaussianSigmaPx = 12.0;
 
 /// How far a seam may be moved in one search, in pixels.
 ///
@@ -144,8 +166,11 @@ class SeamBlendStats {
 
 /// Composites [output] from the best/second contributor buffers.
 ///
-/// All inputs are the stitcher's existing per-pixel buffers; nothing here
-/// allocates per frame, so cost is bounded by the canvas, not the frame count.
+/// [channelGains] holds one bounded multiplicative correction per frame per
+/// channel, indexed `frame * 3 + channel` — the median-ratio colour match the
+/// stitcher solves before compositing. All other inputs are the stitcher's
+/// existing per-pixel buffers; nothing here allocates per frame, so cost is
+/// bounded by the canvas, not the frame count.
 SeamBlendStats compositeSeams({
   required Uint8List output,
   required int width,
@@ -156,10 +181,9 @@ SeamBlendStats compositeSeams({
   required Float32List secondWeight,
   required Int16List bestFrame,
   required Int16List secondFrame,
-  required List<double> gains,
-  required List<double> offsets,
+  required List<double> channelGains,
   required double minWeight,
-  int featherPx = 2,
+  int featherPx = kSeamFeatherPx,
 }) {
   final n = width * height;
 
@@ -173,15 +197,14 @@ SeamBlendStats compositeSeams({
     if (secondWeight[i] > minWeight && secondFrame[i] >= 0) overlap++;
   }
   if (overlap == 0) {
-    // No overlap anywhere: nothing to deghost. Straight copy with exposure.
+    // No overlap anywhere: nothing to deghost. Straight copy with colour gain.
     _writeBestOnly(
       output: output,
       count: n,
       bestColour: bestColour,
       bestWeight: bestWeight,
       bestFrame: bestFrame,
-      gains: gains,
-      offsets: offsets,
+      channelGains: channelGains,
       minWeight: minWeight,
     );
     // The wraparound metric still applies: a single-frame station can still tear
@@ -238,8 +261,8 @@ SeamBlendStats compositeSeams({
   );
 
   // ── 2. Ghost measurement, before compositing. ──────────────────────────
-  // Measured on the *exposure-corrected* contributors, because a brightness
-  // step that the gain/offset solve already removed is not ghosting.
+  // Measured on the *colour-corrected* contributors, because a brightness or
+  // hue step that the median-gain solve already removed is not ghosting.
   var diffSum = 0.0;
   var diffCount = 0;
   var visible = 0;
@@ -250,17 +273,16 @@ SeamBlendStats compositeSeams({
   for (var i = 0; i < n; i++) {
     if (secondWeight[i] <= minWeight || secondFrame[i] < 0) continue;
     // A second contributor without a best one cannot occur in the projection,
-    // but indexing `gains` with −1 here would throw inside the stitching isolate
-    // and fail the whole station. Guarding is cheaper than that risk.
+    // but indexing `channelGains` with −1 here would throw inside the
+    // stitching isolate and fail the whole station. Guarding is cheaper than
+    // that risk.
     if (bestFrame[i] < 0) continue;
-    final gB = gains[bestFrame[i]];
-    final oB = offsets[bestFrame[i]];
-    final gS = gains[secondFrame[i]];
-    final oS = offsets[secondFrame[i]];
+    final bestIdx = bestFrame[i] * 3;
+    final secondIdx = secondFrame[i] * 3;
     var d = 0.0;
     for (var c = 0; c < 3; c++) {
-      final a = bestColour[i * 3 + c] * gB + oB;
-      final b = secondColour[i * 3 + c] * gS + oS;
+      final a = bestColour[i * 3 + c] * channelGains[bestIdx + c];
+      final b = secondColour[i * 3 + c] * channelGains[secondIdx + c];
       d += (a - b).abs();
     }
     d /= 3;
@@ -272,26 +294,16 @@ SeamBlendStats compositeSeams({
   final ghostEnergy = diffCount == 0 ? 0.0 : diffSum / diffCount;
   final ghostFraction = diffCount == 0 ? 0.0 : visible / diffCount;
 
-  // ── 3. Composite: winner-take-all, feathered in a narrow band only. ───
+  // ── 3a. Ownership map and distance-to-seam. ───────────────────────────
   //
-  // Every pixel is rendered from **one** frame. The only cross-fade is a band of
-  // `featherPx` either side of an ownership boundary, which is where the two
-  // photographs are blended 50/50 and then ramp to pure over ~8 px.
-  //
-  // The two earlier attempts failed in opposite directions and this replaces
-  // both:
-  //
-  //  * a blurred binary mask produced hard cut-lines, because at a boundary
-  //    where the owner changes from frame A to frame B *both* sides are "the
-  //    best contributor" — they are best of different pairs — so the mask read
-  //    1.0 across the seam and there was nothing to ramp;
-  //  * blending by the weight ratio everywhere removed the cut-line but mixed a
-  //    bright frame into a dark one across the whole overlap, which is the
-  //    chalky white wash and the semi-transparent double image in the output.
-  //
-  // The band is measured from the **owner change**, which is the only thing that
-  // actually defines a seam, and it is narrow on purpose: 95 % of every
-  // photograph is rendered at full clarity from a single source.
+  // The band below is measured from the **owner change**, which is the only
+  // thing that actually defines a seam, and it is narrow on purpose: all but
+  // a few pixels of every photograph are rendered at full clarity from a
+  // single source. (For history: a blurred binary mask produced hard
+  // cut-lines because the mask read 1.0 across a boundary, and blending by
+  // the weight ratio everywhere mixed a bright frame into a dark one across
+  // the whole overlap — the chalky wash and the translucent double image.
+  // Neither artefact can occur here.)
   final owner = Int16List(n);
   final edge = Uint8List(n);
   var seamPixels = 0;
@@ -326,30 +338,58 @@ SeamBlendStats compositeSeams({
   // pole) turns that cut into a radial gradient without softening the walls.
   final bandForRow = Float32List(height);
   for (var y = 0; y < height; y++) {
-    final latitude = ((0.5 - (y + 0.5) / height) * math.pi).abs() /
-        (math.pi / 2);
+    final latitude =
+        ((0.5 - (y + 0.5) / height) * math.pi).abs() / (math.pi / 2);
     bandForRow[y] = featherPx * (1 + 2 * latitude * latitude);
   }
 
+  // ── 3b. Composite: the owner renders the pixel, feathered at the seam. ─
+  //
+  // Every pixel is rendered from the frame that **owns** it — the graph cut's
+  // side of the seam — at full opacity. The only cross-fade is a band of
+  // `featherPx` either side of an ownership boundary: 50/50 exactly on the
+  // seam, ramping to pure owner at the band's edge.
+  //
+  // The earlier version of this loop blended `best`/`second` by distance but
+  // never read the ownership label, so pixels the cut handed to the second
+  // contributor still rendered the best contributor's colour wherever they
+  // sat outside the band — the wrong side of a parallax-shifted object. This
+  // loop is owner-driven: far from any boundary, alpha is exactly 1.0 on the
+  // owner's side and 0.0 on the other, which is what removes the
+  // translucent-wardrobe double image.
   for (var i = 0; i < n; i++) {
-    final gB = gains[bestFrame[i] < 0 ? 0 : bestFrame[i]];
-    final oB = offsets[bestFrame[i] < 0 ? 0 : bestFrame[i]];
-    if (secondWeight[i] <= minWeight || secondFrame[i] < 0) {
+    final bestIdx = bestFrame[i];
+    // Uncovered pixels stay zero here — `fillUncovered` owns them, and the
+    // gap-fill covered test (`bestWeight > minWeight`) must agree exactly.
+    if (bestIdx < 0 || bestWeight[i] <= minWeight) continue;
+    final secondIdx = secondFrame[i];
+    if (secondIdx < 0 || secondWeight[i] <= minWeight) {
       for (var c = 0; c < 3; c++) {
-        output[i * 3 + c] = _clamp(bestColour[i * 3 + c] * gB + oB);
+        output[i * 3 + c] = _clamp(
+          bestColour[i * 3 + c] * channelGains[bestIdx * 3 + c],
+        );
       }
       continue;
     }
-    final gS = gains[secondFrame[i]];
-    final oS = offsets[secondFrame[i]];
-    // 0.5 exactly on the seam, ramping to 1.0 at the edge of the band.
+    final ownSecond = label[i] == 1;
+    final ownIdx = ownSecond ? secondIdx : bestIdx;
+    final otherIdx = ownSecond ? bestIdx : secondIdx;
+    // Gaussian cumulative profile: 0.5 exactly on the seam, rising to ~1.0
+    // at two sigma. This is the per-pixel equivalent of blurring each owner
+    // mask with a 41×41, σ=12 Gaussian and normalising W_i / ΣW_i, without a
+    // second full-canvas mask. No linear ramp remains, so the rectangular
+    // borders that a linear 5px ramp left on flat walls are gone.
     final band = bandForRow[i ~/ width];
-    final t = (seamDistance[i] / band).clamp(0.0, 1.0);
-    final wBest = 0.5 + 0.5 * t;
+    final t = _seamGaussian(seamDistance[i] / band);
+    final wOwn = 0.5 + 0.5 * t;
     for (var c = 0; c < 3; c++) {
-      final b = bestColour[i * 3 + c] * gB + oB;
-      final s2 = secondColour[i * 3 + c] * gS + oS;
-      output[i * 3 + c] = _clamp(b * wBest + s2 * (1 - wBest));
+      final ownValue =
+          (ownSecond ? secondColour[i * 3 + c] : bestColour[i * 3 + c]) *
+          channelGains[ownIdx * 3 + c];
+      final otherValue =
+          (ownSecond ? bestColour[i * 3 + c] : secondColour[i * 3 + c]) *
+          channelGains[otherIdx * 3 + c];
+      output[i * 3 + c] = _clamp(ownValue * wOwn + otherValue * (1 - wOwn));
     }
   }
 
@@ -362,7 +402,9 @@ SeamBlendStats compositeSeams({
     for (var x = 1; x < width; x++) {
       final i = row + x;
       final ownerHere = label[i] == 0 ? bestFrame[i] : secondFrame[i];
-      final ownerPrev = label[i - 1] == 0 ? bestFrame[i - 1] : secondFrame[i - 1];
+      final ownerPrev = label[i - 1] == 0
+          ? bestFrame[i - 1]
+          : secondFrame[i - 1];
       if (ownerHere == ownerPrev) continue;
       seamStepSum += _outputDelta(output, i, i - 1);
       seamStepCount++;
@@ -545,19 +587,46 @@ void _writeBestOnly({
   required Uint8List bestColour,
   required Float32List bestWeight,
   required Int16List bestFrame,
-  required List<double> gains,
-  required List<double> offsets,
+  required List<double> channelGains,
   required double minWeight,
 }) {
   for (var i = 0; i < count; i++) {
     if (bestWeight[i] <= minWeight) continue;
     final f = bestFrame[i] < 0 ? 0 : bestFrame[i];
-    final g = gains[f];
-    final o = offsets[f];
     for (var c = 0; c < 3; c++) {
-      output[i * 3 + c] = _clamp(bestColour[i * 3 + c] * g + o);
+      output[i * 3 + c] = _clamp(
+        bestColour[i * 3 + c] * channelGains[f * 3 + c],
+      );
     }
   }
+}
+
+/// Gaussian cumulative weight from a signed seam distance normalised by the
+/// feather band: `erf(d / (σ√2))`, 0 at the seam, ~1 beyond two sigma.
+///
+/// `dart:math` has no `erf`, so Abramowitz–Stegun 7.1.26 supplies it — the
+/// approximation is within 1.5e-7 over the whole domain, far below one byte
+/// of output. Using the CDF rather than a linear ramp is what removes the
+/// visible brightness boundary on large flat walls and ceilings.
+double _seamGaussian(double normalisedDistance) {
+  // `normalisedDistance` is distance / band. At the equator band == 20 px,
+  // so scaling by 20/12 turns it into distance / sigma with sigma = 12 px;
+  // toward the poles the band (and therefore sigma) widens with latitude.
+  final dSigma = normalisedDistance * (kSeamFeatherPx / kSeamGaussianSigmaPx);
+  final x = dSigma < 0 ? 0.0 : dSigma;
+  if (x >= 3.0) return 1.0;
+  final z = x / math.sqrt(2);
+  const double a1 = 0.254829592;
+  const double a2 = -0.284496736;
+  const double a3 = 1.421413741;
+  const double a4 = -1.453152027;
+  const double a5 = 1.061405429;
+  const double p = 0.3275911;
+  final t = 1 / (1 + p * z);
+  final erf =
+      1 -
+      (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * math.exp(-z * z));
+  return erf.clamp(0.0, 1.0).toDouble();
 }
 
 /// Chamfer distance, in pixels, from each pixel to the nearest seam pixel.
@@ -598,7 +667,9 @@ Float32List _distanceToEdge(Uint8List edge, int width, int height) {
     for (var x = width - 1; x >= 0; x--) {
       final i = row + x;
       var best = distance[i];
-      if (x + 1 < width && distance[i + 1] + 1 < best) best = distance[i + 1] + 1;
+      if (x + 1 < width && distance[i + 1] + 1 < best) {
+        best = distance[i + 1] + 1;
+      }
       if (y + 1 < height) {
         if (distance[i + width] + 1 < best) best = distance[i + width] + 1;
         if (x + 1 < width && distance[i + width + 1] + diagonal < best) {
@@ -613,6 +684,5 @@ Float32List _distanceToEdge(Uint8List edge, int width, int height) {
   }
   return distance;
 }
-
 
 int _clamp(double v) => v <= 0 ? 0 : (v >= 255 ? 255 : v.round());

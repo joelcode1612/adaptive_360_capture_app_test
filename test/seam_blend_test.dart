@@ -85,8 +85,7 @@ void main() {
       secondWeight: secondWeight,
       bestFrame: bestFrame,
       secondFrame: secondFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 
@@ -98,9 +97,12 @@ void main() {
   });
 
   test('identical contributors produce a byte-exact copy', () {
-    final flat = Uint8List(width * height * 3)..fillRange(0, width * height * 3, 137);
-    final weight = Float32List(width * height)..fillRange(0, width * height, 1.0);
-    final second = Float32List(width * height)..fillRange(0, width * height, 0.2);
+    final flat = Uint8List(width * height * 3)
+      ..fillRange(0, width * height * 3, 137);
+    final weight = Float32List(width * height)
+      ..fillRange(0, width * height, 1.0);
+    final second = Float32List(width * height)
+      ..fillRange(0, width * height, 0.2);
     final frames = Int16List(width * height);
     final other = Int16List(width * height)..fillRange(0, width * height, 1);
 
@@ -115,8 +117,7 @@ void main() {
       secondWeight: second,
       bestFrame: frames,
       secondFrame: other,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 
@@ -125,9 +126,11 @@ void main() {
     expect(stats.ghostFraction, 0);
   });
 
-  test('no overlap is a straight copy with exposure applied', () {
-    final single = Uint8List(width * height * 3)..fillRange(0, width * height * 3, 100);
-    final weight = Float32List(width * height)..fillRange(0, width * height, 1.0);
+  test('no overlap is a straight copy with colour gain applied', () {
+    final single = Uint8List(width * height * 3)
+      ..fillRange(0, width * height * 3, 100);
+    final weight = Float32List(width * height)
+      ..fillRange(0, width * height, 1.0);
     final none = Float32List(width * height);
     final frames = Int16List(width * height);
 
@@ -142,8 +145,8 @@ void main() {
       secondWeight: none,
       bestFrame: frames,
       secondFrame: frames,
-      gains: <double>[0.5, 1.0],
-      offsets: <double>[10.0, 0.0],
+      // Frame 0 dimmed to 60% across all three channels.
+      channelGains: <double>[0.6, 0.6, 0.6, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 
@@ -153,10 +156,14 @@ void main() {
   });
 
   test('disagreement is measured, not hidden', () {
-    final bright = Uint8List(width * height * 3)..fillRange(0, width * height * 3, 187);
-    final dark = Uint8List(width * height * 3)..fillRange(0, width * height * 3, 137);
-    final weight = Float32List(width * height)..fillRange(0, width * height, 1.0);
-    final second = Float32List(width * height)..fillRange(0, width * height, 0.2);
+    final bright = Uint8List(width * height * 3)
+      ..fillRange(0, width * height * 3, 187);
+    final dark = Uint8List(width * height * 3)
+      ..fillRange(0, width * height * 3, 137);
+    final weight = Float32List(width * height)
+      ..fillRange(0, width * height, 1.0);
+    final second = Float32List(width * height)
+      ..fillRange(0, width * height, 0.2);
     final frames = Int16List(width * height);
     final other = Int16List(width * height)..fillRange(0, width * height, 1);
 
@@ -171,8 +178,7 @@ void main() {
       secondWeight: second,
       bestFrame: frames,
       secondFrame: other,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 
@@ -219,8 +225,7 @@ void main() {
       secondWeight: wSecond,
       bestFrame: bFrame,
       secondFrame: sFrame,
-      gains: <double>[1.0, 1.0],
-      offsets: <double>[0.0, 0.0],
+      channelGains: <double>[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
       minWeight: 0.001,
     );
 

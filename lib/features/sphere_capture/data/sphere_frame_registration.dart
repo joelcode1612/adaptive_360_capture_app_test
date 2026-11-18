@@ -108,7 +108,7 @@ class SphereRegistrationOutcome {
     rejectedEdges: 0,
     featureTotal: 0,
     elapsed: Duration.zero,
-    notes: <String>[if (note != null) note],
+    notes: <String>[?note],
   );
 }
 
@@ -120,9 +120,11 @@ class SphereRegistrationOutcome {
 /// is not decided here: this only decides *where* each frame points.
 const int kSphereRegistrationDecodeReduction = cv.IMREAD_REDUCED_COLOR_4;
 
-/// Features per frame. Enough for a texture-poor wall, few enough that 38 frames
-/// of descriptors stay under a couple of megabytes.
-const int kSphereRegistrationFeatures = 1200;
+/// Features per frame. 2000 (raised from 1200) gives low-texture indoor walls
+/// enough surviving matches after the ratio test for the rotation solve to
+/// bite — the fallback when the feature-based Stitcher refuses a station.
+/// 38 frames of descriptors stay under ~4 MB.
+const int kSphereRegistrationFeatures = 2000;
 
 /// Lowe's ratio. Above this the match is ambiguous and is dropped rather than
 /// left for RANSAC to sort out — RANSAC is good at rejecting outliers, not at
@@ -156,10 +158,7 @@ const int kSphereRegistrationAveragingPasses = 2;
 /// re-matching each time would multiply the station's cost by that count for
 /// exactly the same answer.
 class _PairMatches {
-  const _PairMatches({
-    required this.points,
-    required this.featureMatches,
-  });
+  const _PairMatches({required this.points, required this.featureMatches});
 
   /// Coordinates as `(first, second)` — the pair's lower index first.
   final List<SphereCorrespondence> points;
@@ -348,6 +347,7 @@ SphereRegistrationOutcome registerSphereFrames({
       residualCount++;
       if (value > residualMax) residualMax = value;
     }
+
     final notes = <String>[];
     final rotations = <Quat>[for (final f in frames) f.rotation];
     final settled = List<bool>.filled(frames.length, false);
@@ -363,7 +363,9 @@ SphereRegistrationOutcome registerSphereFrames({
       final cached = matches[pairIndex];
       if (cached == null) return SphereEdgeRefinement.none;
       final firstIsSubject = pairs[pairIndex].$1 == subject;
-      final reference = firstIsSubject ? pairs[pairIndex].$2 : pairs[pairIndex].$1;
+      final reference = firstIsSubject
+          ? pairs[pairIndex].$2
+          : pairs[pairIndex].$1;
       final subjectProjection = projections[subject];
       final referenceProjection = projections[reference];
       if (subjectProjection == null || referenceProjection == null) {

@@ -1,16 +1,14 @@
 /// Per-channel colour balance across the frames of one station.
 ///
-/// ## Why this is separate from the exposure solve
+/// ## Why this exists alongside the stitcher's median gains
 ///
-/// [solveExposureGains] recovers one gain and one offset per photograph from the
-/// pixels two photographs share. That levels *brightness* — the dominant
-/// difference, because every frame runs its own auto-exposure loop. It cannot
-/// level *hue*: if one frame's auto-white-balance drifted a few percent warm
-/// while the camera panned past a coloured wall, a gain and an offset move all
-/// three channels together and the seam stays visible as a colour step even
-/// though its luminance matches.
+/// [solveChannelMedianGains] in the stitcher recovers one bounded gain per
+/// photograph per channel from the medians of the pixels photographs share.
+/// That levels the dominant difference — every frame runs its own
+/// auto-exposure and auto-white-balance loop — but a frame whose overlap
+/// samples are sparse or skewed can keep a residual hue step.
 ///
-/// This pass corrects the residual per channel. Each frame's mean colour over
+/// This pass corrects that residual per channel. Each frame's mean colour over
 /// the pixels it shares with a neighbour is compared with the station-wide mean,
 /// and the ratio becomes a bounded multiplicative correction.
 ///
@@ -80,7 +78,8 @@ Float64List solveColourBalance({
     }
   }
 
-  final balance = Float64List(frameCount * 3)..fillRange(0, frameCount * 3, 1.0);
+  final balance = Float64List(frameCount * 3)
+    ..fillRange(0, frameCount * 3, 1.0);
   if (totalWeight <= 0) return balance;
   for (var c = 0; c < 3; c++) {
     reference[c] /= totalWeight;
@@ -112,9 +111,7 @@ void applyColourBalance(
     final base = f * 3;
     for (var c = 0; c < 3; c++) {
       final value = colour[i * 3 + c] * balance[base + c];
-      colour[i * 3 + c] = value <= 0
-          ? 0
-          : (value >= 255 ? 255 : value.round());
+      colour[i * 3 + c] = value <= 0 ? 0 : (value >= 255 ? 255 : value.round());
     }
   }
 }
