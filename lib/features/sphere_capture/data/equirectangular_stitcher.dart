@@ -196,6 +196,12 @@ const bool kSphereEnableCvStitcher = bool.fromEnvironment('sphere_cv_stitch');
 /// run asks for it: `--dart-define=sphere_stitch_log=true`.
 const bool kSphereStitchLog = bool.fromEnvironment('sphere_stitch_log');
 
+/// Opt-in strict acceptance: refuse to advertise a 100% photographed panorama
+/// if even one projected pixel required synthetic gap fill. Does not remove
+/// fillUncovered; it keeps diagnostics available for an incomplete attempt.
+const bool kSphereRequire100PhotoCoverage =
+    bool.fromEnvironment('sphere_require_100_photo_coverage');
+
 /// The smallest projection weight a pixel may carry and still be written.
 ///
 /// Below this the frame is grazing that direction so steeply that its colour is
@@ -668,6 +674,7 @@ int resolveSphereStitchWidth(int requested) {
   // neighbour. Median resists outliers, per-channel absorbs white-balance
   // drift, and [0.65, 1.45] bounds what "exposure difference" may explain.
   final channelGains = solveChannelMedianGains(
+    imageWidth: width,
     pixelCount: width * height,
     frameCount: records.length,
     bestFrame: bestFrame,
@@ -984,6 +991,21 @@ int resolveSphereStitchWidth(int requested) {
     // diagnostics, not the product.
   }
 
+  // PANORAMA_SEAM_QUALITY_20261119: the existing 99.5% area-based
+  // acceptance threshold is intentionally preserved for legacy builds.
+  // When strict quality mode is on, not one output pixel can come from
+  // synthetic gap fill. Report the missing source pixels instead of silently
+  // claiming a visually complete, 100%-photo-backed sphere.
+  if (kSphereRequire100PhotoCoverage && filledPixels > 0) {
+    return (
+      ok: false,
+      message: 'Panorama needs retakes: $filledPixels pixels had no original '
+          'photograph and were filled synthetically. Open coverage_map.jpg and '
+          'coverage_report.json for missing directions. Original photos are '
+          'safe; no incomplete panorama was accepted.',
+    );
+  }
+
   if (single < 0.995) {
     final lon = worstLon >= 0 ? '+${worstLon.round()}' : '${worstLon.round()}';
     final lat = worstLat >= 0 ? '+${worstLat.round()}' : '${worstLat.round()}';
@@ -1130,6 +1152,22 @@ int _lerp4(int c00, int c10, int c01, int c11, double du, double dv) =>
 /// absorb auto-white-balance drift; the clamp stops a disagreement about the
 /// scene from being "fixed" as exposure. A pair with too few shared samples
 /// contributes no edge — its frame keeps gain 1 rather than a guess.
+/// Estimates stable per-frame RGB gains from corresponding overlap pixels.
+///
+/// The previous implementation compared the independent median colour of each
+/// frame. Indoors, those medians can describe different objects (e.g. a dark
+/// wardrobe and a white wall), causing a large false colour correction. It also
+/// propagated corrections through a single BFS tree, accumulating drift.
+///
+/// This implementation instead:
+/// - samples the *same projected pixel* from both frames;
+/// - skips invalid, clipped, high-gradient and chromatically inconsistent pairs;
+/// - robustly estimates ratios using histograms of per-pixel log ratios;
+/// - solves all reliable pairwise relations together, with identity regularisation;
+/// - limits per-frame brightness and chromatic corrections to avoid wild tints.
+///
+/// The returned gains are indexed as [frame * 3 + channel], in the existing
+/// RGB order used by bestColour/secondColour and by compositeSeams.
 @visibleForTesting
 Float64List solveChannelMedianGains({
   required int pixelCount,
@@ -1141,99 +1179,209 @@ Float64List solveChannelMedianGains({
   required Uint8List bestColour,
   required Uint8List secondColour,
   double minWeight = 0,
+  int? imageWidth,
 }) {
-  const double gainMin = 0.65;
-  const double gainMax = 1.45;
-  // Below this many shared samples a median is noise, not evidence.
+  const int bins = 141;
+  const double minLogRatio = -0.70;
+  const double maxLogRatio = 0.70;
   const int minSamples = 48;
+  const double maxIqr = 0.17;
+  const double chromaTolerance = 0.42;
+  const double maxLocalGradient = 12.0;
+  const double ridgeWeight = 0.075;
+  const double minFrameGain = 0.72;
+  const double maxFrameGain = 1.38;
+  const double maxChromaLog = 0.13;
 
-  final gains = Float64List(frameCount * 3)..fillRange(0, frameCount * 3, 1.0);
-  if (frameCount < 2) return gains;
+  final gains = Float64List(frameCount * 3)
+    ..fillRange(0, frameCount * 3, 1.0);
+  if (frameCount < 2 || pixelCount < 1) return gains;
 
-  // Per-pair histograms: key = a * frameCount + b (a < b), value = two
-  // frames × three channels × 256 byte bins. 38 frames at worst is ~2.2 MB,
-  // bounded by the pairs that actually overlap rather than all 703 pairs.
-  final pairHist = <int, Int32List>{};
-  final pairSamples = <int, Int32List>{};
-  for (var i = 0; i < pixelCount; i++) {
+  // Each pair has three histograms of log(A/B), where A is the lower frame ID.
+  // Using a *per-pixel ratio* removes the scene-composition bias of comparing
+  // independent medians. Histogram bins make the estimate robust to parallax.
+  final histograms = <int, Int32List>{};
+  final counts = <int, int>{};
+  for (var i = 0; i < pixelCount; i += 3) {
     final best = bestFrame[i];
     final second = secondFrame[i];
-    if (best < 0 || second < 0 || best == second) continue;
-    // Grazing slivers carry lens falloff, not exposure information.
-    if (secondWeight[i] < 0.35 * bestWeight[i]) continue;
-    final key = best < second
-        ? best * frameCount + second
-        : second * frameCount + best;
-    final hist = pairHist.putIfAbsent(key, () => Int32List(2 * 3 * 256));
-    final samples = pairSamples.putIfAbsent(key, () => Int32List(2 * 3));
-    final bestSlot = best < second ? 0 : 1;
-    final secondSlot = 1 - bestSlot;
-    for (var c = 0; c < 3; c++) {
-      final bestValue = bestColour[i * 3 + c];
-      final secondValue = secondColour[i * 3 + c];
-      hist[(bestSlot * 3 + c) * 256 + bestValue]++;
-      samples[bestSlot * 3 + c]++;
-      hist[(secondSlot * 3 + c) * 256 + secondValue]++;
-      samples[secondSlot * 3 + c]++;
+    if (best < 0 || second < 0 || best == second ||
+        best >= frameCount || second >= frameCount) {
+      continue;
     }
-  }
-  if (pairHist.isEmpty) return gains;
-
-  // Value where the cumulative count first reaches half.
-  int median(Int32List hist, int offset, int total) {
-    final target = (total + 1) ~/ 2;
-    var cumulative = 0;
-    for (var v = 0; v < 256; v++) {
-      cumulative += hist[offset + v];
-      if (cumulative >= target) return v;
+    final wb = bestWeight[i];
+    final ws = secondWeight[i];
+    if (wb <= minWeight || ws <= minWeight ||
+        ws < wb * 0.35) {
+      continue;
     }
-    return 255;
-  }
 
-  // Undirected overlap graph, built from the pair histograms.
-  final neighbours = List<List<int>>.generate(frameCount, (_) => <int>[]);
-  for (final key in pairHist.keys) {
-    final a = key ~/ frameCount;
-    final b = key % frameCount;
-    neighbours[a].add(b);
-    neighbours[b].add(a);
-  }
-
-  // Breadth-first from the anchor: every frame is calibrated against a
-  // neighbour that is already calibrated, so error cannot be handed to both
-  // sides of a pair in opposite directions.
-  final settled = List<bool>.filled(frameCount, false);
-  settled[0] = true;
-  final queue = <int>[0];
-  for (var head = 0; head < queue.length; head++) {
-    final u = queue[head];
-    for (final v in neighbours[u]) {
-      if (settled[v]) continue;
-      settled[v] = true;
-      final key = u < v ? u * frameCount + v : v * frameCount + u;
-      final hist = pairHist[key]!;
-      final samples = pairSamples[key]!;
-      final uSlot = u < v ? 0 : 1;
-      final vSlot = 1 - uSlot;
-      for (var c = 0; c < 3; c++) {
-        final uSamples = samples[uSlot * 3 + c];
-        final vSamples = samples[vSlot * 3 + c];
-        if (uSamples < minSamples || vSamples < minSamples) continue;
-        final uMedian = median(hist, (uSlot * 3 + c) * 256, uSamples);
-        final vMedian = median(hist, (vSlot * 3 + c) * 256, vSamples);
-        // Near-black overlaps carry no exposure information and divide badly.
-        if (uMedian < 1 || vMedian < 1) continue;
-        final raw = gains[u * 3 + c] * uMedian / vMedian;
-        gains[v * 3 + c] = raw < gainMin
-            ? gainMin
-            : (raw > gainMax ? gainMax : raw);
+    final off = i * 3;
+    if (imageWidth != null && imageWidth > 1) {
+      // Only use locally smooth, stable overlapping areas. Object edges and
+      // inconsistent label changes are where parallax corrupts comparisons.
+      if (i % imageWidth == imageWidth - 1 || i + 1 >= pixelCount ||
+          bestFrame[i + 1] != best || secondFrame[i + 1] != second) {
+        continue;
       }
-      queue.add(v);
+      final next = off + 3;
+      var flat = true;
+      for (var c = 0; c < 3; c++) {
+        if ((bestColour[off + c] - bestColour[next + c]).abs() >
+                maxLocalGradient ||
+            (secondColour[off + c] - secondColour[next + c]).abs() >
+                maxLocalGradient) {
+          flat = false;
+          break;
+        }
+      }
+      if (!flat) continue;
+    }
+
+    final r1 = bestColour[off].toDouble();
+    final g1 = bestColour[off + 1].toDouble();
+    final b1 = bestColour[off + 2].toDouble();
+    final r2 = secondColour[off].toDouble();
+    final g2 = secondColour[off + 1].toDouble();
+    final b2 = secondColour[off + 2].toDouble();
+    // Very dark and clipped measurements do not reveal a trustworthy exposure
+    // ratio; nor do pixels whose colours differ because they are different
+    // surfaces, not differently exposed views of the same surface.
+    if (r1 < 15 || g1 < 15 || b1 < 15 ||
+        r2 < 15 || g2 < 15 || b2 < 15 ||
+        r1 > 245 || g1 > 245 || b1 > 245 ||
+        r2 > 245 || g2 > 245 || b2 > 245) {
+      continue;
+    }
+    final y1 = 0.2126 * r1 + 0.7152 * g1 + 0.0722 * b1;
+    final y2 = 0.2126 * r2 + 0.7152 * g2 + 0.0722 * b2;
+    if (y1 < 22 || y2 < 22 || y1 > 240 || y2 > 240) continue;
+    final luminanceRatio = y1 / y2;
+    if (luminanceRatio < 0.50 || luminanceRatio > 2.0) continue;
+    if ((r1 / y1 - r2 / y2).abs() > chromaTolerance ||
+        (g1 / y1 - g2 / y2).abs() > chromaTolerance ||
+        (b1 / y1 - b2 / y2).abs() > chromaTolerance) {
+      continue;
+    }
+
+    final lowerIsBest = best < second;
+    final logR = math.log((lowerIsBest ? r1 : r2) /
+        (lowerIsBest ? r2 : r1));
+    final logG = math.log((lowerIsBest ? g1 : g2) /
+        (lowerIsBest ? g2 : g1));
+    final logB = math.log((lowerIsBest ? b1 : b2) /
+        (lowerIsBest ? b2 : b1));
+    if (logR < minLogRatio || logR > maxLogRatio ||
+        logG < minLogRatio || logG > maxLogRatio ||
+        logB < minLogRatio || logB > maxLogRatio) {
+      continue;
+    }
+    final rBin = (((logR - minLogRatio) /
+            (maxLogRatio - minLogRatio)) * (bins - 1)).round();
+    final gBin = (((logG - minLogRatio) /
+            (maxLogRatio - minLogRatio)) * (bins - 1)).round();
+    final bBin = (((logB - minLogRatio) /
+            (maxLogRatio - minLogRatio)) * (bins - 1)).round();
+    final a = lowerIsBest ? best : second;
+    final b = lowerIsBest ? second : best;
+    final key = a * frameCount + b;
+    final hist = histograms.putIfAbsent(key, () => Int32List(3 * bins));
+    hist[rBin]++;
+    hist[bins + gBin]++;
+    hist[2 * bins + bBin]++;
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  if (histograms.isEmpty) return gains;
+
+  int quantileBin(Int32List hist, int start, int count, double fraction) {
+    final target = math.max(1, (count * fraction).ceil());
+    var cumulative = 0;
+    for (var j = 0; j < bins; j++) {
+      cumulative += hist[start + j];
+      if (cumulative >= target) return j;
+    }
+    return bins - 1;
+  }
+
+  // Encode each reliable overlap as an edge: log(gain_b)-log(gain_a) =
+  // log(pixel_a/pixel_b). Trim broad, inconsistent histograms rather than
+  // forcing a correction from overlapping but different objects.
+  final edges =
+      <({int a, int b, double weight, List<double> ratios})>[];
+  for (final entry in histograms.entries) {
+    final count = counts[entry.key] ?? 0;
+    if (count < minSamples) continue;
+    final ratios = <double>[];
+    var valid = true;
+    for (var c = 0; c < 3; c++) {
+      final start = c * bins;
+      final q1 = quantileBin(entry.value, start, count, 0.25);
+      final median = quantileBin(entry.value, start, count, 0.50);
+      final q3 = quantileBin(entry.value, start, count, 0.75);
+      final spread = (q3 - q1) *
+          (maxLogRatio - minLogRatio) / (bins - 1);
+      if (spread > maxIqr) {
+        valid = false;
+        break;
+      }
+      ratios.add(minLogRatio + median *
+          (maxLogRatio - minLogRatio) / (bins - 1));
+    }
+    if (!valid) continue;
+    edges.add((
+      a: entry.key ~/ frameCount,
+      b: entry.key % frameCount,
+      weight: math.min(1.0, count / 300.0),
+      ratios: ratios,
+    ));
+  }
+  if (edges.isEmpty) return gains;
+
+  // A small regularizer to identity fixes the otherwise arbitrary exposure
+  // baseline and keeps disconnected frames at exactly 1.0. All pair edges are
+  // optimized jointly: this avoids BFS propagation drift around a 360° loop.
+  final solved = List<Float64List>.generate(
+      3, (_) => Float64List(frameCount));
+  for (var channel = 0; channel < 3; channel++) {
+    final x = solved[channel];
+    for (var pass = 0; pass < 90; pass++) {
+      var largestChange = 0.0;
+      for (var f = 0; f < frameCount; f++) {
+        var numerator = 0.0;
+        var denominator = ridgeWeight;
+        for (final e in edges) {
+          if (e.a == f) {
+            numerator += e.weight * (x[e.b] - e.ratios[channel]);
+            denominator += e.weight;
+          } else if (e.b == f) {
+            numerator += e.weight * (x[e.a] + e.ratios[channel]);
+            denominator += e.weight;
+          }
+        }
+        final next = numerator / denominator;
+        largestChange = math.max(largestChange, (next - x[f]).abs());
+        x[f] = next;
+      }
+      if (largestChange < 0.00005) break;
+    }
+  }
+
+  final minLogGain = math.log(minFrameGain);
+  final maxLogGain = math.log(maxFrameGain);
+  for (var f = 0; f < frameCount; f++) {
+    final mean = (solved[0][f] + solved[1][f] + solved[2][f]) / 3;
+    for (var c = 0; c < 3; c++) {
+      // Exposure can shift more than white balance. Limit relative RGB shifts
+      // so a dark wall does not get corrected toward purple/yellow.
+      final chroma = (solved[c][f] - mean)
+          .clamp(-maxChromaLog, maxChromaLog).toDouble();
+      final corrected = (mean + chroma)
+          .clamp(minLogGain, maxLogGain).toDouble();
+      gains[f * 3 + c] = math.exp(corrected);
     }
   }
   return gains;
 }
-
 /// Fills every pixel no photograph reached, by propagating colour outward from
 /// the covered boundary, then smoothing the filled region.
 ///

@@ -77,23 +77,14 @@ const double kGhostVisibleDelta = 24.0;
 /// Feather half-width, in pixels, applied strictly across an ownership
 /// boundary.
 ///
-/// Twenty pixels per side — a 41-pixel support, Gaussian σ=12 profile — is
-/// what a now-rotation-aligned, gain-matched pair needs for its boundary to
-/// disappear. The earlier 5-pixel feather left visible steps because the two
-/// frames still disagreed geometrically; widening it was unsafe then. With
-/// alignment solid, the cross-fade is wide enough to hide the rectangular
-/// wall/ceiling borders while still confining any 50/50 mixing to a thin
-/// strip instead of the whole overlap (which is what ghosted the wardrobe).
-const int kSeamFeatherPx = 20;
+/// Keep this transition narrow: long feather bands double close objects
+/// when parallax makes overlapping frames disagree geometrically.
+const int kSeamFeatherPx = 6;
 
 /// Sigma of the Gaussian profile used across the ownership seam.
 ///
-/// Paired with [kSeamFeatherPx] this is the equivalent of blurring each
-/// binary owner mask with `cv.GaussianBlur(Size(41, 41), 12.0)` and
-/// normalising the two weights — without allocating a second 6 MB mask over
-/// the canvas. The cumulative Gaussian is evaluated from the chamfer
-/// distance to the seam, which is already computed for the edge map.
-const double kSeamGaussianSigmaPx = 12.0;
+/// A short Gaussian falloff only around genuine, well-aligned seams.
+const double kSeamGaussianSigmaPx = 2.0;
 
 /// How far a seam may be moved in one search, in pixels.
 ///
@@ -260,6 +251,21 @@ SeamBlendStats compositeSeams({
     minWeight: minWeight,
   );
 
+  // Remove isolated graph-cut / row-polish staircase teeth, but only where
+  // the original photographs agree. This does not fabricate scene data.
+  final smoothedSpikes = smoothIsolatedSeamSpikes(
+    label: label,
+    width: width,
+    height: height,
+    bestFrame: bestFrame,
+    secondFrame: secondFrame,
+    bestWeight: bestWeight,
+    secondWeight: secondWeight,
+    bestColour: bestColour,
+    secondColour: secondColour,
+    minWeight: minWeight,
+  );
+
   // ── 2. Ghost measurement, before compositing. ──────────────────────────
   // Measured on the *colour-corrected* contributors, because a brightness or
   // hue step that the median-gain solve already removed is not ghosting.
@@ -304,22 +310,34 @@ SeamBlendStats compositeSeams({
   // the weight ratio everywhere mixed a bright frame into a dark one across
   // the whole overlap — the chalky wash and the translucent double image.
   // Neither artefact can occur here.)
-  final owner = Int16List(n);
+  // Build the full ownership map before looking up any neighbours.
+  // Previously, right/down neighbours were still at the Int16List default 0,
+  // marking nearly every pixel owned by any other frame as a fake seam.
+  // The feather then mixed two photographs across whole walls and furniture.
+  final owner = Int16List(n)..fillRange(0, n, -1);
+  for (var i = 0; i < n; i++) {
+    if (bestFrame[i] < 0 || bestWeight[i] <= minWeight) continue;
+    final useSecond =
+        secondFrame[i] >= 0 &&
+        secondWeight[i] > minWeight &&
+        label[i] == 1;
+    owner[i] = useSecond ? secondFrame[i] : bestFrame[i];
+  }
+
+  // Only real boundaries between two covered photographs are seams.
   final edge = Uint8List(n);
   var seamPixels = 0;
   for (var y = 0; y < height; y++) {
     final row = y * width;
     for (var x = 0; x < width; x++) {
       final i = row + x;
-      final own = (secondWeight[i] <= minWeight || secondFrame[i] < 0)
-          ? bestFrame[i]
-          : (label[i] == 0 ? bestFrame[i] : secondFrame[i]);
-      owner[i] = own;
-      var isEdge = false;
-      if (x > 0 && owner[i - 1] != own) isEdge = true;
-      if (x + 1 < width && owner[i + 1] != own) isEdge = true;
-      if (y > 0 && owner[i - width] != own) isEdge = true;
-      if (y + 1 < height && owner[i + width] != own) isEdge = true;
+      final own = owner[i];
+      if (own < 0) continue;
+      final isEdge =
+          (x > 0 && owner[i - 1] >= 0 && owner[i - 1] != own) ||
+          (x + 1 < width && owner[i + 1] >= 0 && owner[i + 1] != own) ||
+          (y > 0 && owner[i - width] >= 0 && owner[i - width] != own) ||
+          (y + 1 < height && owner[i + width] >= 0 && owner[i + width] != own);
       if (isEdge) {
         edge[i] = 1;
         seamPixels++;
@@ -329,13 +347,8 @@ SeamBlendStats compositeSeams({
 
   final seamDistance = _distanceToEdge(edge, width, height);
 
-  // The feather widens toward the poles.
-  //
-  // A ring-to-ring seam runs roughly vertically, and a 9 px band is right for
-  // it. A pole frame meets its ring along a *circle*, and the same narrow band
-  // there reads as a polygonal cut — the hexagonal floor edge around the user's
-  // feet. Scaling the band with latitude squared (1× at the equator, 3× at the
-  // pole) turns that cut into a radial gradient without softening the walls.
+  // Retain pole-aware feather scaling, but only actual matching neighbours
+  // may blend, and only over a few pixels.
   final bandForRow = Float32List(height);
   for (var y = 0; y < height; y++) {
     final latitude =
@@ -380,8 +393,18 @@ SeamBlendStats compositeSeams({
     // second full-canvas mask. No linear ramp remains, so the rectangular
     // borders that a linear 5px ramp left on flat walls are gone.
     final band = bandForRow[i ~/ width];
-    final t = _seamGaussian(seamDistance[i] / band);
-    final wOwn = 0.5 + 0.5 * t;
+    // Per-pixel top-two ranks do not define a globally consistent frame pair.
+    // The second candidate must genuinely own an adjacent seam pixel; mixing
+    // an unrelated third photo produced the translucent polygon artifacts.
+    // For substantial geometric disagreement, keep the owner's full-opacity
+    // colour instead of displaying two displaced objects at partial opacity.
+    final canFeather =
+        seamDistance[i] < band &&
+        diffField[i] <= kGhostVisibleDelta &&
+        _hasNeighbourOwnedBy(owner, width, height, i, otherIdx);
+    final wOwn = canFeather
+        ? 0.5 + 0.5 * _seamGaussian(seamDistance[i] / band)
+        : 1.0;
     for (var c = 0; c < 3; c++) {
       final ownValue =
           (ownSecond ? secondColour[i * 3 + c] : bestColour[i * 3 + c]) *
@@ -414,7 +437,7 @@ SeamBlendStats compositeSeams({
 
   return SeamBlendStats(
     seamPixels: seamPixels,
-    flippedPixels: moved,
+    flippedPixels: moved + smoothedSpikes,
     overlapPixels: overlap,
     ghostEnergy: ghostEnergy,
     ghostFraction: ghostFraction,
@@ -599,6 +622,118 @@ void _writeBestOnly({
       );
     }
   }
+}
+
+/// Only a frame actually visible on the opposite side of this boundary is a
+/// valid feathering partner. A nearby unrelated seam is not sufficient.
+/// An alternative may be a few pixels across the same seam rather than
+/// immediately adjacent. Keep the search local and limited to genuine owner
+/// pixels: best/second ranks can represent entirely different pairs elsewhere.
+bool _hasNeighbourOwnedBy(
+  Int16List owner,
+  int width,
+  int height,
+  int i,
+  int otherFrame,
+) {
+  if (otherFrame < 0) return false;
+  final x = i % width;
+  final y = i ~/ width;
+  const maxDistance = 6;
+  for (var distance = 1; distance <= maxDistance; distance++) {
+    final left = x - distance;
+    final right = x + distance;
+    final up = y - distance;
+    final down = y + distance;
+    if (left >= 0 && owner[y * width + left] == otherFrame) return true;
+    if (right < width && owner[y * width + right] == otherFrame) return true;
+    if (up >= 0 && owner[up * width + x] == otherFrame) return true;
+    if (down < height && owner[down * width + x] == otherFrame) return true;
+    // Diagonal approaches matter for staircase-shaped contours.
+    if (left >= 0 && up >= 0 && owner[up * width + left] == otherFrame) {
+      return true;
+    }
+    if (right < width && up >= 0 && owner[up * width + right] == otherFrame) {
+      return true;
+    }
+    if (left >= 0 && down < height &&
+        owner[down * width + left] == otherFrame) {
+      return true;
+    }
+    if (right < width && down < height &&
+        owner[down * width + right] == otherFrame) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// PANORAMA_SEAM_QUALITY_20261119: remove only isolated, low-difference
+/// ownership spikes. The graph cut and row polish sometimes leave single-pixel
+/// staircase teeth at the edges of a wall or wardrobe. Do not change a pixel
+/// unless at least three direct neighbours genuinely belong to the other
+/// candidate frame and its two photographs already agree photometrically.
+/// Never invent pixels, copy from an unrelated third frame, or blur an object.
+int smoothIsolatedSeamSpikes({
+  required Uint8List label,
+  required int width,
+  required int height,
+  required Int16List bestFrame,
+  required Int16List secondFrame,
+  required Float32List bestWeight,
+  required Float32List secondWeight,
+  required Uint8List bestColour,
+  required Uint8List secondColour,
+  required double minWeight,
+}) {
+  if (width < 3 || height < 3) return 0;
+  final n = width * height;
+  final flips = Uint8List(n);
+  int ownerAt(int i) {
+    if (bestFrame[i] < 0 || bestWeight[i] <= minWeight) return -1;
+    if (label[i] == 1 && secondFrame[i] >= 0 &&
+        secondWeight[i] > minWeight) {
+      return secondFrame[i];
+    }
+    return bestFrame[i];
+  }
+
+  // Read only from the original label map in this sweep: editing in-place
+  // creates order-dependent streaks that make the seam even more jagged.
+  for (var y = 1; y + 1 < height; y++) {
+    final row = y * width;
+    for (var x = 1; x + 1 < width; x++) {
+      final i = row + x;
+      if (secondFrame[i] < 0 || secondWeight[i] <= minWeight ||
+          bestFrame[i] < 0 || bestWeight[i] <= minWeight ||
+          bestFrame[i] == secondFrame[i]) {
+        continue;
+      }
+      final current = ownerAt(i);
+      final alternative = label[i] == 0 ? secondFrame[i] : bestFrame[i];
+      if (current == alternative) continue;
+      final neighbours = <int>[i - 1, i + 1, i - width, i + width];
+      var alternativeCount = 0;
+      for (final j in neighbours) {
+        if (ownerAt(j) == alternative) alternativeCount++;
+      }
+      if (alternativeCount < 3) continue;
+      var difference = 0;
+      for (var c = 0; c < 3; c++) {
+        difference += (bestColour[i * 3 + c] -
+                secondColour[i * 3 + c]).abs();
+      }
+      if (difference / 3 > kGhostVisibleDelta) continue;
+      flips[i] = 1;
+    }
+  }
+  var changed = 0;
+  for (var i = 0; i < n; i++) {
+    if (flips[i] == 0) continue;
+    label[i] = label[i] == 0 ? 1 : 0;
+    changed++;
+  }
+  return changed;
 }
 
 /// Gaussian cumulative weight from a signed seam distance normalised by the

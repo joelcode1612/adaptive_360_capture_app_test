@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "SiteWise 360 - strict photo coverage",
+      "type": "dart",
+      "request": "launch",
+      "toolArgs": [
+        "--dart-define-from-file=config/sitewise_dev.env"
+      ]
+    }
+  ]
+}

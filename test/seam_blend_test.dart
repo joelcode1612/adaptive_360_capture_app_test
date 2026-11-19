@@ -96,6 +96,100 @@ void main() {
     expect(stats.seamDiscontinuity, lessThan(1.0));
   });
 
+  test('nonzero frame ID does not cause phantom full-image feather', () {
+    // Regression: looking at uninitialised right/down owner pixels interpreted
+    // a constant frame ID of 2 as a seam covering nearly the whole canvas.
+    final count = width * height;
+    final best = Uint8List(count * 3)..fillRange(0, count * 3, 200);
+    final second = Uint8List(count * 3)..fillRange(0, count * 3, 30);
+    final bw = Float32List(count)..fillRange(0, count, 1.0);
+    final sw = Float32List(count)..fillRange(0, count, 0.5);
+    final bf = Int16List(count)..fillRange(0, count, 2);
+    final sf = Int16List(count)..fillRange(0, count, 1);
+    final output = Uint8List(count * 3);
+    final stats = compositeSeams(
+      output: output,
+      width: width,
+      height: height,
+      bestColour: best,
+      secondColour: second,
+      bestWeight: bw,
+      secondWeight: sw,
+      bestFrame: bf,
+      secondFrame: sf,
+      channelGains: <double>[1, 1, 1, 1, 1, 1, 1, 1, 1],
+      minWeight: 0.001,
+    );
+    expect(output.every((int v) => v == 200), isTrue);
+    expect(stats.seamPixels, 0);
+  });
+
+  test('unrelated third frame is not mixed across an owner boundary', () {
+    final count = width * height;
+    final best = Uint8List(count * 3)..fillRange(0, count * 3, 190);
+    final second = Uint8List(count * 3)..fillRange(0, count * 3, 80);
+    final bw = Float32List(count)..fillRange(0, count, 1.0);
+    final sw = Float32List(count)..fillRange(0, count, 0.5);
+    final bf = Int16List(count);
+    final sf = Int16List(count)..fillRange(0, count, 3);
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        bf[y * width + x] = x < width ~/ 2 ? 1 : 2;
+      }
+    }
+    final output = Uint8List(count * 3);
+    final stats = compositeSeams(
+      output: output,
+      width: width,
+      height: height,
+      bestColour: best,
+      secondColour: second,
+      bestWeight: bw,
+      secondWeight: sw,
+      bestFrame: bf,
+      secondFrame: sf,
+      channelGains: <double>[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      minWeight: 0.001,
+    );
+    expect(stats.seamPixels, greaterThan(0));
+    expect(output.every((int v) => v == 190), isTrue);
+  });
+
+  test('isolated seam tooth is smoothed only when photos agree', () {
+    const w = 7;
+    const h = 7;
+    final n = w * h;
+    final label = Uint8List(n);
+    label[3 * w + 3] = 1;
+    final bFrame = Int16List(n);
+    final sFrame = Int16List(n)..fillRange(0, n, 1);
+    final bw = Float32List(n)..fillRange(0, n, 1);
+    final sw = Float32List(n)..fillRange(0, n, 0.8);
+    final a = Uint8List(n * 3)..fillRange(0, n * 3, 100);
+    final b = Uint8List(n * 3)..fillRange(0, n * 3, 110);
+    final removed = smoothIsolatedSeamSpikes(
+      label: label, width: w, height: h,
+      bestFrame: bFrame, secondFrame: sFrame,
+      bestWeight: bw, secondWeight: sw,
+      bestColour: a, secondColour: b, minWeight: 0.001,
+    );
+    expect(removed, 1);
+    expect(label[3 * w + 3], 0);
+
+    // Same jagged topology but wildly different scene content. Never
+    // substitute a second object just to hide the border.
+    label[3 * w + 3] = 1;
+    b.fillRange(0, n * 3, 220);
+    final unsafe = smoothIsolatedSeamSpikes(
+      label: label, width: w, height: h,
+      bestFrame: bFrame, secondFrame: sFrame,
+      bestWeight: bw, secondWeight: sw,
+      bestColour: a, secondColour: b, minWeight: 0.001,
+    );
+    expect(unsafe, 0);
+    expect(label[3 * w + 3], 1);
+  });
+
   test('identical contributors produce a byte-exact copy', () {
     final flat = Uint8List(width * height * 3)
       ..fillRange(0, width * height * 3, 137);
