@@ -41,6 +41,164 @@ class SphereRegistrationFrame {
   final int cropOffsetY;
 }
 
+
+/// SITEWISE_OBJECT_INTEGRITY_V1: bounded image-space affine residual from
+/// geometrically checked ORB matches after quaternion registration. All
+/// coefficients are fractions of the decoded width/height, so a correction
+/// estimated at quarter resolution scales correctly during final composition.
+/// The source JPEGs are NEVER rewritten or replaced.
+class SphereResidualAffine {
+  const SphereResidualAffine({
+    this.du0 = 0, this.duX = 0, this.duY = 0,
+    this.dv0 = 0, this.dvX = 0, this.dvY = 0,
+  });
+
+  static const SphereResidualAffine identity = SphereResidualAffine();
+  final double du0, duX, duY, dv0, dvX, dvY;
+
+  /// The warp is strongest in the overlap/periphery and fades towards image
+  /// centre, where altering pixels would only bend already-aligned objects.
+  /// Maximum displacement per axis is 35 pixels in the composition decode.
+  ({double du, double dv}) shiftAt({
+    required double u,
+    required double v,
+    required int width,
+    required int height,
+    double maxPx = 35.0,
+  }) {
+    if (width < 1 || height < 1) return (du: 0.0, dv: 0.0);
+    final nx = 2.0 * u / width - 1.0;
+    final ny = 2.0 * v / height - 1.0;
+    final radius = math.max(nx.abs(), ny.abs());
+    final t = ((radius - 0.15) / 0.75).clamp(0.0, 1.0).toDouble();
+    final peripheral = t * t * (3.0 - 2.0 * t);
+    final du = (du0 + duX * nx + duY * ny) * width * peripheral;
+    final dv = (dv0 + dvX * nx + dvY * ny) * height * peripheral;
+    return (
+      du: du.clamp(-maxPx, maxPx).toDouble(),
+      dv: dv.clamp(-maxPx, maxPx).toDouble(),
+    );
+  }
+}
+
+class _ResidualPoint {
+  const _ResidualPoint(this.x, this.y, this.du, this.dv);
+  final double x, y, du, dv; // x/y normalized, du/dv in registration pixels
+}
+
+/// Robust pairwise affine fit. Only an already-aligned, earlier neighbour
+/// may provide correspondences. Large or inconsistent parallax is rejected,
+/// rather than blindly forcing an affine model onto objects at different depths.
+SphereResidualAffine _fitResidualAffine(
+  List<_ResidualPoint> points,
+  DecodedProjection projection,
+) {
+  if (points.length < 24) return SphereResidualAffine.identity;
+  final us = <double>[for (final p in points) p.du]..sort();
+  final vs = <double>[for (final p in points) p.dv]..sort();
+  final medianU = us[us.length ~/ 2];
+  final medianV = vs[vs.length ~/ 2];
+  // At this stage the rotation should have resolved gross alignment. Accept
+  // only spatially coherent residuals; close-object parallax can exceed this.
+  final coherent = <_ResidualPoint>[
+    for (final p in points)
+      if ((p.du - medianU).abs() <= 6.0 &&
+          (p.dv - medianV).abs() <= 6.0)
+        p,
+  ];
+  if (coherent.length < 24 || coherent.length < points.length * 0.60) {
+    return SphereResidualAffine.identity;
+  }
+
+  // Coordinates are normalized to prevent 4x decode reduction from changing
+  // fitted rotation/shear. Regularize slope terms to avoid overfitting a
+  // tiny cluster of ORB points on one nearby chair/door.
+  final normal = List<double>.filled(9, 0);
+  final rhsU = List<double>.filled(3, 0);
+  final rhsV = List<double>.filled(3, 0);
+  for (final p in coherent) {
+    final a = <double>[1.0, p.x, p.y];
+    for (var r = 0; r < 3; r++) {
+      rhsU[r] += a[r] * p.du / projection.width;
+      rhsV[r] += a[r] * p.dv / projection.height;
+      for (var c = 0; c < 3; c++) {
+        normal[r * 3 + c] += a[r] * a[c];
+      }
+    }
+  }
+  normal[0] += 0.01;
+  normal[4] += 8.0;
+  normal[8] += 8.0;
+  final u = _solveAffine3(normal, rhsU);
+  final v = _solveAffine3(normal, rhsV);
+  if (u == null || v == null) return SphereResidualAffine.identity;
+  final fitted = SphereResidualAffine(
+    du0: u[0], duX: u[1], duY: u[2],
+    dv0: v[0], dvX: v[1], dvY: v[2],
+  );
+  var before = 0.0;
+  var after = 0.0;
+  for (final p in coherent) {
+    final targetDu = (u[0] + u[1] * p.x + u[2] * p.y) * projection.width;
+    final targetDv = (v[0] + v[1] * p.x + v[2] * p.y) * projection.height;
+    before += math.sqrt(p.du * p.du + p.dv * p.dv);
+    after += math.sqrt(math.pow(p.du - targetDu, 2) +
+        math.pow(p.dv - targetDv, 2));
+  }
+  // Discard insignificant or contradictory adjustments. A 35px clamp is an
+  // emergency bound, NOT a licence to accept arbitrary projective distortion.
+  if (before < 0.5 * coherent.length || after >= 0.85 * before) {
+    return SphereResidualAffine.identity;
+  }
+  if ((u[0] * projection.width).abs() > 25 ||
+      (v[0] * projection.height).abs() > 25 ||
+      u[1].abs() > 0.018 || u[2].abs() > 0.018 ||
+      v[1].abs() > 0.018 || v[2].abs() > 0.018) {
+    return SphereResidualAffine.identity;
+  }
+  return fitted;
+}
+
+/// Minimal, pivoted Gaussian elimination for the two 3x3 affine fits.
+List<double>? _solveAffine3(List<double> coefficients, List<double> rhs) {
+  final a = List<double>.of(coefficients);
+  final b = List<double>.of(rhs);
+  for (var k = 0; k < 3; k++) {
+    var pivot = k;
+    for (var row = k + 1; row < 3; row++) {
+      if (a[row * 3 + k].abs() > a[pivot * 3 + k].abs()) pivot = row;
+    }
+    if (a[pivot * 3 + k].abs() < 1e-10) return null;
+    if (pivot != k) {
+      for (var col = 0; col < 3; col++) {
+        final temp = a[k * 3 + col];
+        a[k * 3 + col] = a[pivot * 3 + col];
+        a[pivot * 3 + col] = temp;
+      }
+      final temp = b[k];
+      b[k] = b[pivot];
+      b[pivot] = temp;
+    }
+    for (var row = k + 1; row < 3; row++) {
+      final ratio = a[row * 3 + k] / a[k * 3 + k];
+      for (var col = k; col < 3; col++) {
+        a[row * 3 + col] -= ratio * a[k * 3 + col];
+      }
+      b[row] -= ratio * b[k];
+    }
+  }
+  final solution = List<double>.filled(3, 0);
+  for (var row = 2; row >= 0; row--) {
+    var total = b[row];
+    for (var col = row + 1; col < 3; col++) {
+      total -= a[row * 3 + col] * solution[col];
+    }
+    solution[row] = total / a[row * 3 + row];
+    if (!solution[row].isFinite) return null;
+  }
+  return solution;
+}
+
 /// What the registration produced.
 ///
 /// [rotations] is index-aligned with the input list. A frame with no trustworthy
@@ -60,9 +218,13 @@ class SphereRegistrationOutcome {
     this.meanResidualAfterPx = 0,
     this.maxResidualAfterPx = 0,
     this.residualSamples = 0,
+    this.residualAffines = const <SphereResidualAffine>[],
   });
 
   final List<Quat> rotations;
+
+  /// Conservative image-space residual corrections after ORB/RANSAC rotation.
+  final List<SphereResidualAffine> residualAffines;
 
   /// How far each frame ended up rotated from its recorded orientation, degrees.
   final List<double> correctionDeg;
@@ -124,7 +286,7 @@ const int kSphereRegistrationDecodeReduction = cv.IMREAD_REDUCED_COLOR_4;
 /// enough surviving matches after the ratio test for the rotation solve to
 /// bite — the fallback when the feature-based Stitcher refuses a station.
 /// 38 frames of descriptors stay under ~4 MB.
-const int kSphereRegistrationFeatures = 2000;
+const int kSphereRegistrationFeatures = 2500;
 
 /// Lowe's ratio. Above this the match is ambiguous and is dropped rather than
 /// left for RANSAC to sort out — RANSAC is good at rejecting outliers, not at
@@ -453,6 +615,72 @@ SphereRegistrationOutcome registerSphereFrames({
       );
     }
 
+    // SITEWISE_OBJECT_INTEGRITY_V1: residual affine alignment AFTER rotation.
+    // Estimate a small warp from already-RANSAC-checked ORB correspondences.
+    // Every frame is referenced against an earlier trusted neighbour, not
+    // a continually changing composited image. Inconsistent close parallax
+    // is deliberately left to the edge-avoiding seam, not warped aggressively.
+    final residualAffines = List<SphereResidualAffine>.filled(
+      frames.length, SphereResidualAffine.identity,
+    );
+    for (var i = 1; i < frames.length; i++) {
+      if (!usable[i] || projections[i] == null) continue;
+      var chosen = -1;
+      var reference = -1;
+      var largestInliers = 0;
+      for (final p in neighbours[i]) {
+        final other = pairs[p].$1 == i ? pairs[p].$2 : pairs[p].$1;
+        final candidate = matches[p];
+        if (other >= i || projections[other] == null || candidate == null ||
+            candidate.points.length < 24) continue;
+        if (candidate.points.length > largestInliers) {
+          largestInliers = candidate.points.length;
+          chosen = p;
+          reference = other;
+        }
+      }
+      if (chosen < 0) continue;
+      final subjectProjection = projections[i]!;
+      final neighbourProjection = projections[reference]!;
+      final cached = matches[chosen]!;
+      final subjectFirst = pairs[chosen].$1 == i;
+      final correspondences = subjectFirst ? cached.points : cached.reversed();
+      final observations = <_ResidualPoint>[];
+      for (final c in correspondences) {
+        // Include the earlier frame's accepted residual displacement when
+        // constructing the reference world ray. A match still points to the
+        // exact original image pixel, so compensate for the previous warp.
+        final referenceShift = residualAffines[reference].shiftAt(
+          u: c.neighbourU, v: c.neighbourV,
+          width: neighbourProjection.width,
+          height: neighbourProjection.height,
+        );
+        final world = rotations[reference].rotate(unprojectPixel(
+          c.neighbourU - referenceShift.du,
+          c.neighbourV - referenceShift.dv,
+          neighbourProjection,
+        ));
+        final predicted = projectCameraRay(
+          rotations[i].conjugate.rotate(world),
+          subjectProjection,
+        );
+        if (predicted == null) continue;
+        final du = c.frameU - predicted.u;
+        final dv = c.frameV - predicted.v;
+        if (!du.isFinite || !dv.isFinite || du.abs() > 40 || dv.abs() > 40) {
+          continue;
+        }
+        observations.add(_ResidualPoint(
+          2 * c.frameU / subjectProjection.width - 1,
+          2 * c.frameV / subjectProjection.height - 1,
+          du, dv,
+        ));
+      }
+      residualAffines[i] = _fitResidualAffine(
+        observations, subjectProjection,
+      );
+    }
+
     // ── 4. Report, keeping the prior wherever nothing was proven ───────
     final correctionDeg = List<double>.filled(frames.length, 0);
     var refinedFrames = 0;
@@ -472,6 +700,7 @@ SphereRegistrationOutcome registerSphereFrames({
 
     return SphereRegistrationOutcome(
       rotations: rotations,
+      residualAffines: residualAffines,
       correctionDeg: correctionDeg,
       pairsConsidered: pairs.length,
       acceptedEdges: accepted,

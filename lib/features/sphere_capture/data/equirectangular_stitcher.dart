@@ -475,6 +475,12 @@ int resolveSphereStitchWidth(int requested) {
       final focal = decoded.focalPx;
       final cx = decoded.cx;
       final cy = decoded.cy;
+      // SITEWISE_OBJECT_INTEGRITY_V1: bounded affine residual found by
+      // 2500-feature ORB / RANSAC registration. Preserve the original image
+      // and quaternion projection when there are no trustworthy matches.
+      final residualAffine = frameIndex < registration.residualAffines.length
+          ? registration.residualAffines[frameIndex]
+          : SphereResidualAffine.identity;
       if (kSphereStitchLog && frameIndex == 0) {
         debugPrint(
           'SPHERE_STITCH: decoded=${imageWidth}x$imageHeight '
@@ -566,8 +572,19 @@ int resolveSphereStitchWidth(int requested) {
           final camZ = dz + 2 * (qw * c0z + c1z);
           final depth = -camZ;
           if (depth <= 0.05) continue;
-          final u = cx + focal * camX / depth;
-          final v = cy - focal * camY / depth;
+          final predictedU = cx + focal * camX / depth;
+          final predictedV = cy - focal * camY / depth;
+          // Correct small remaining 2D affine residuals only near overlaps,
+          // clamped to +/-35 decoded-image pixels per axis. This is deliberately
+          // not an unrestricted homography on 3D-parallax foregrounds.
+          final offset = residualAffine.shiftAt(
+            u: predictedU,
+            v: predictedV,
+            width: imageWidth,
+            height: imageHeight,
+          );
+          final u = predictedU + offset.du;
+          final v = predictedV + offset.dv;
           if (u < 0 || u >= imageWidth - 1 || v < 0 || v >= imageHeight - 1) {
             continue;
           }

@@ -29,10 +29,9 @@
 /// * **t-link (data).** Assigning a pixel to a frame costs `−ln(w)`, the same
 ///   sampling preference the projection weights already encode. A frame that
 ///   sees the direction obliquely or near its edge is expensive to use.
-/// * **n-link (seam).** Cutting between two neighbours costs
-///   `kSeamCostWeight · meanChannelDelta / 255`, the disagreement the two frames
-///   show there. The cut is therefore cheap exactly where the photographs agree,
-///   which is what makes a seam invisible.
+/// * **n-link (seam).** The energy combines the photometric difference
+///   with a strong Sobel edge penalty. A low-contrast wall is cheaper to cut
+///   than a wardrobe, monitor or fan-cage edge.
 library;
 
 import 'dart:math' as math;
@@ -93,6 +92,7 @@ Uint8List? findSeamLabels({
   // ── Per-cell data costs, averaged over the pixels the cell covers. ─────
   final dataBest = Float64List(cells);
   final dataSecond = Float64List(cells);
+  // Per-node edge-aware cut cost, sampled in source-consistent pixels.
   final deltaSum = Float64List(cells);
   final active = Uint8List(cells);
 
@@ -132,7 +132,39 @@ Uint8List? findSeamLabels({
       }
       dataBest[cell] = bestCost / activeCount;
       dataSecond[cell] = secondCost / activeCount;
-      deltaSum[cell] = delta / activeCount;
+      // SITEWISE_OBJECT_INTEGRITY_V1: edge-avoiding seam energy.
+      // Gradients use source frame IDs so a top-two rank swap does not create
+      // an artificial Sobel edge on a flat wall. The centre pixel is used
+      // when it is a true overlap, otherwise find a valid pixel in this cell.
+      final centreX = math.min(width - 1, gx * scale + scale ~/ 2);
+      final centreY = math.min(height - 1, gy * scale + scale ~/ 2);
+      var sampleIndex = centreY * width + centreX;
+      if (secondFrame[sampleIndex] < 0 ||
+          secondWeight[sampleIndex] <= minWeight) {
+        sampleIndex = -1;
+        for (var yy = gy * scale; yy < y1 && sampleIndex < 0; yy++) {
+          for (var xx = gx * scale; xx < x1; xx++) {
+            final candidate = yy * width + xx;
+            if (secondFrame[candidate] >= 0 &&
+                secondWeight[candidate] > minWeight) {
+              sampleIndex = candidate;
+              break;
+            }
+          }
+        }
+      }
+      final edgeEnergy = sampleIndex < 0 ? 0.0 : seamSobelEdgeEnergyAt(
+        bestColour: bestColour,
+        secondColour: secondColour,
+        bestFrame: bestFrame,
+        secondFrame: secondFrame,
+        width: width,
+        height: height,
+        index: sampleIndex,
+      );
+      final colorDiff = delta / activeCount;
+      final cost = colorDiff + 6.0 * edgeEnergy;
+      deltaSum[cell] = cost;
       active[cell] = 1;
     }
   }
@@ -309,3 +341,89 @@ double _delta(Uint8List a, Uint8List b, int i) =>
         (a[i * 3 + 1] - b[i * 3 + 1]).abs() +
         (a[i * 3 + 2] - b[i * 3 + 2]).abs()) /
     3.0;
+
+
+/// SITEWISE_OBJECT_INTEGRITY_V1: combined Sobel energy from BOTH candidate
+/// photographs, scaled to the same 0..255 intensity units as [seamPixelCostAt].
+/// Neighbours from a different source frame use the centre sample instead of
+/// becoming a fake edge when the best/second contributors switch identities.
+double seamSobelEdgeEnergyAt({
+  required Uint8List bestColour,
+  required Uint8List secondColour,
+  required Int16List bestFrame,
+  required Int16List secondFrame,
+  required int width,
+  required int height,
+  required int index,
+}) {
+  final x = index % width;
+  final y = index ~/ width;
+  return _sobelAt(bestColour, bestFrame, width, height, x, y) +
+      _sobelAt(secondColour, secondFrame, width, height, x, y);
+}
+
+/// Pixel energy in native intensity units: cost = colorDiff + 6 * edgeEnergy.
+/// Used both to validate edge avoidance and for full-resolution seam polish.
+double seamPixelCostAt({
+  required Uint8List bestColour,
+  required Uint8List secondColour,
+  required Int16List bestFrame,
+  required Int16List secondFrame,
+  required int width,
+  required int height,
+  required int index,
+}) {
+  final colorDiff = _delta(bestColour, secondColour, index);
+  final edgeEnergy = seamSobelEdgeEnergyAt(
+    bestColour: bestColour,
+    secondColour: secondColour,
+    bestFrame: bestFrame,
+    secondFrame: secondFrame,
+    width: width,
+    height: height,
+    index: index,
+  );
+  return colorDiff + 6.0 * edgeEnergy;
+}
+
+double _sobelAt(
+  Uint8List rgb,
+  Int16List frameIds,
+  int width,
+  int height,
+  int x,
+  int y,
+) {
+  final i = y * width + x;
+  final frameId = frameIds[i];
+  if (frameId < 0) return 0;
+  final centre = _luma(rgb, i);
+  double sample(int dx, int dy) {
+    final xx = x + dx;
+    final yy = y + dy;
+    if (xx < 0 || xx >= width || yy < 0 || yy >= height) return centre;
+    final j = yy * width + xx;
+    if (frameIds[j] != frameId) return centre;
+    return _luma(rgb, j);
+  }
+
+  final tl = sample(-1, -1);
+  final t = sample(0, -1);
+  final tr = sample(1, -1);
+  final l = sample(-1, 0);
+  final r = sample(1, 0);
+  final bl = sample(-1, 1);
+  final b = sample(0, 1);
+  final br = sample(1, 1);
+  // Normalize the usual Sobel [-1 0 1; -2 0 2; -1 0 1] response
+  // by 4 so a maximum-contrast step has roughly 255 units of energy.
+  final dx = (-tl - 2 * l - bl + tr + 2 * r + br) / 4;
+  final dy = (-tl - 2 * t - tr + bl + 2 * b + br) / 4;
+  return math.sqrt(dx * dx + dy * dy).clamp(0.0, 255.0).toDouble();
+}
+
+double _luma(Uint8List rgb, int i) {
+  final off = i * 3;
+  return rgb[off] * 0.299 + rgb[off + 1] * 0.587 +
+      rgb[off + 2] * 0.114;
+}

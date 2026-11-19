@@ -84,7 +84,7 @@ const int kSeamFeatherPx = 6;
 /// Sigma of the Gaussian profile used across the ownership seam.
 ///
 /// A short Gaussian falloff only around genuine, well-aligned seams.
-const double kSeamGaussianSigmaPx = 2.0;
+const double kSeamGaussianSigmaPx = 4.0;
 
 /// How far a seam may be moved in one search, in pixels.
 ///
@@ -347,14 +347,13 @@ SeamBlendStats compositeSeams({
 
   final seamDistance = _distanceToEdge(edge, width, height);
 
-  // Retain pole-aware feather scaling, but only actual matching neighbours
-  // may blend, and only over a few pixels.
-  final bandForRow = Float32List(height);
-  for (var y = 0; y < height; y++) {
-    final latitude =
-        ((0.5 - (y + 0.5) / height) * math.pi).abs() / (math.pi / 2);
-    bandForRow[y] = featherPx * (1 + 2 * latitude * latitude);
-  }
+  // SITEWISE_OBJECT_INTEGRITY_V1: a 12px-wide transition, 6px each
+  // side, even near the poles. Its Gaussian mask has sigma=4 (equivalent to
+  // the centre portion of a 19x19 GaussianBlur kernel). This does NOT blur
+  // photographed objects: only agreeing pixels along real ownership seams
+  // can blend; all other pixels remain 100% their assigned frame.
+  final bandForRow = Float32List(height)
+    ..fillRange(0, height, featherPx.toDouble());
 
   // ── 3b. Composite: the owner renders the pixel, feathered at the seam. ─
   //
@@ -403,7 +402,8 @@ SeamBlendStats compositeSeams({
         diffField[i] <= kGhostVisibleDelta &&
         _hasNeighbourOwnedBy(owner, width, height, i, otherIdx);
     final wOwn = canFeather
-        ? 0.5 + 0.5 * _seamGaussian(seamDistance[i] / band)
+        ? 0.5 + 0.5 * (_seamGaussian(seamDistance[i] / band) /
+              _seamGaussian(1.0)).clamp(0.0, 1.0)
         : 1.0;
     for (var c = 0; c < 3; c++) {
       final ownValue =
@@ -493,7 +493,10 @@ int refineSeams({
       moved += _tryShiftBoundary(
         label: label,
         width: width,
+        height: height,
         rowStart: row,
+        bestFrame: bestFrame,
+        secondFrame: secondFrame,
         boundary: x,
         bestWeight: bestWeight,
         secondWeight: secondWeight,
@@ -509,8 +512,11 @@ int refineSeams({
 int _tryShiftBoundary({
   required Uint8List label,
   required int width,
+  required int height,
   required int rowStart,
   required int boundary,
+  required Int16List bestFrame,
+  required Int16List secondFrame,
   required Float32List bestWeight,
   required Float32List secondWeight,
   required Uint8List bestColour,
@@ -519,6 +525,10 @@ int _tryShiftBoundary({
   final current = _seamCostAt(
     rowStart: rowStart,
     position: boundary,
+    width: width,
+    height: height,
+    bestFrame: bestFrame,
+    secondFrame: secondFrame,
     bestColour: bestColour,
     secondColour: secondColour,
   );
@@ -551,6 +561,10 @@ int _tryShiftBoundary({
     final seam = _seamCostAt(
       rowStart: rowStart,
       position: target,
+      width: width,
+      height: height,
+      bestFrame: bestFrame,
+      secondFrame: secondFrame,
       bestColour: bestColour,
       secondColour: secondColour,
     );
@@ -584,11 +598,27 @@ int _tryShiftBoundary({
 double _seamCostAt({
   required int rowStart,
   required int position,
+  required int width,
+  required int height,
+  required Int16List bestFrame,
+  required Int16List secondFrame,
   required Uint8List bestColour,
   required Uint8List secondColour,
 }) {
   final i = rowStart + position;
-  return kSeamCostWeight * _colourDelta(bestColour, secondColour, i) / 255.0;
+  // SITEWISE_OBJECT_INTEGRITY_V1: the graph-cut and the full-res polish
+  // minimize the SAME edge-aware seam energy. A seam must not move back
+  // through a monitor bezel or cabinet edge in the polish stage.
+  final cost = seamPixelCostAt(
+    bestColour: bestColour,
+    secondColour: secondColour,
+    bestFrame: bestFrame,
+    secondFrame: secondFrame,
+    width: width,
+    height: height,
+    index: i,
+  );
+  return kSeamCostWeight * cost / 255.0;
 }
 
 /// Mean absolute channel difference between two composited pixels.
@@ -744,9 +774,8 @@ int smoothIsolatedSeamSpikes({
 /// of output. Using the CDF rather than a linear ramp is what removes the
 /// visible brightness boundary on large flat walls and ceilings.
 double _seamGaussian(double normalisedDistance) {
-  // `normalisedDistance` is distance / band. At the equator band == 20 px,
-  // so scaling by 20/12 turns it into distance / sigma with sigma = 12 px;
-  // toward the poles the band (and therefore sigma) widens with latitude.
+  // `normalisedDistance` is distance / the 6px half-width; the
+  // Gaussian sigma is 4px. Mask values are normalized at band edge.
   final dSigma = normalisedDistance * (kSeamFeatherPx / kSeamGaussianSigmaPx);
   final x = dSigma < 0 ? 0.0 : dSigma;
   if (x >= 3.0) return 1.0;
