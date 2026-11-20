@@ -45,6 +45,7 @@ class SphereCaptureScreen extends StatefulWidget {
     this.sessionId,
     this.userId,
     this.propertyId,
+    this.autoStart = false,
   });
 
   /// Injection points for tests and for callers that already hold a station.
@@ -70,6 +71,10 @@ class SphereCaptureScreen extends StatefulWidget {
   /// `public.property.property_id` for the panorama this capture belongs to.
   final int? propertyId;
 
+  /// Launch the camera immediately when coming from the last guide page.
+  /// Existing direct callers keep the legacy start screen by default.
+  final bool autoStart;
+
   @override
   State<SphereCaptureScreen> createState() => _SphereCaptureScreenState();
 }
@@ -86,6 +91,11 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    if (widget.autoStart) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _start();
+      });
+    }
   }
 
   @override
@@ -190,6 +200,24 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
     final controller = _controller;
     final camera = _camera;
     if (controller == null || camera == null) {
+      // A guide-started capture must not show a second Start button.
+      // On genuine camera errors, retain the existing retry UI.
+      if (widget.autoStart && _startError == null) {
+        return const Scaffold(
+          backgroundColor: CaptureColors.cameraChrome,
+          body: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(color: CaptureColors.accentOnDark),
+                SizedBox(height: 18),
+                Text('Opening 360° camera…',
+                    style: TextStyle(color: Colors.white, fontSize: 16)),
+              ],
+            ),
+          ),
+        );
+      }
       return _StartScreen(
         onStart: _starting ? null : _start,
         starting: _starting,
