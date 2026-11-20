@@ -196,6 +196,15 @@ const bool kSphereEnableCvStitcher = bool.fromEnvironment('sphere_cv_stitch');
 /// run asks for it: `--dart-define=sphere_stitch_log=true`.
 const bool kSphereStitchLog = bool.fromEnvironment('sphere_stitch_log');
 
+/// Optional conservative acceptance gate for misregistered or ghosted seams.
+/// Evaluate seam metrics with real-device fixtures before enabling by default.
+const bool kSphereStrictSeamIntegrity =
+    bool.fromEnvironment('sphere_strict_seam_integrity');
+const double kSphereMaxSeamDiscontinuity =
+    double.fromEnvironment('sphere_max_seam_discontinuity', defaultValue: 16);
+const double kSphereMaxGhostFraction =
+    double.fromEnvironment('sphere_max_ghost_fraction', defaultValue: 0.04);
+
 /// Opt-in strict acceptance: refuse to advertise a 100% photographed panorama
 /// if even one projected pixel required synthetic gap fill. Does not remove
 /// fillUncovered; it keeps diagnostics available for an incomplete attempt.
@@ -966,6 +975,13 @@ int resolveSphereStitchWidth(int requested) {
     // What the seam pass did and how much disagreement it could not
     // remove — the direct measure of whether ghosting survives.
     'seamBlend': seamStats.toJson(),
+    'integrityGate': {
+      'enabled': kSphereStrictSeamIntegrity,
+      'maxSeamDiscontinuity': kSphereMaxSeamDiscontinuity,
+      'maxGhostFraction': kSphereMaxGhostFraction,
+      'passed': seamStats.seamDiscontinuity <= kSphereMaxSeamDiscontinuity &&
+          seamStats.ghostFraction <= kSphereMaxGhostFraction,
+    },
     // The feature-stitched equatorial band. When `embedded` is true the
     // equatorial band comes from cv.Stitcher's bundle-adjusted, gain-
     // compensated composite; the coverage numbers below describe the pose
@@ -1006,6 +1022,19 @@ int resolveSphereStitchWidth(int requested) {
   } catch (_) {
     // A missing report must not fail an otherwise valid panorama; the map is
     // diagnostics, not the product.
+  }
+
+  if (kSphereStrictSeamIntegrity &&
+      (seamStats.seamDiscontinuity > kSphereMaxSeamDiscontinuity ||
+       seamStats.ghostFraction > kSphereMaxGhostFraction)) {
+    return (
+      ok: false,
+      message: 'The panorama has visible seam mismatch '
+          '(seam step ${seamStats.seamDiscontinuity.toStringAsFixed(1)}, '
+          'ghost share ${(seamStats.ghostFraction * 100).toStringAsFixed(1)}%). '
+          'Original photographs were kept. Inspect coverage_report.json and '
+          'retake or realign the affected region before accepting.',
+    );
   }
 
   // PANORAMA_SEAM_QUALITY_20261119: the existing 99.5% area-based

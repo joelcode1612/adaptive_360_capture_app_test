@@ -1,3 +1,5 @@
+// SITEWISE_360_BRANCH_PARALLAX_V1
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -5,17 +7,41 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
+
 /// The camera surface the sphere flow needs, and nothing more.
 ///
 /// Deliberately narrow so the capture controller can be driven by a fake in
 /// tests: preview, one full-resolution still, and a lifecycle. The ARCore
 /// still path is not involved — there is no AR session holding the sensor, so
 /// the ordinary `camera` plugin can open it directly.
+/// A single ARCore camera-to-world pose, in the OpenGL -Z-forward basis used
+/// by the sphere projection. CameraX does not provide this position evidence.
+class SphereCameraPose {
+  const SphereCameraPose({
+    required this.position,
+    required this.orientation,
+    required this.tracking,
+    this.timestampNs,
+  });
+  final Vec3 position;
+  final Quat orientation;
+  final bool tracking;
+  final int? timestampNs;
+}
+
 abstract class SphereCamera {
   /// Opens the rear camera at its highest still resolution.
   Future<void> open();
 
   bool get isOpen;
+
+  /// Null for CameraX (no translation measurement); live ARCore 6DoF otherwise.
+  Stream<SphereCameraPose>? get trackedPoses => null;
+
+  /// Exact ARCore shutter pose when available; null for CameraX.
+  SphereCameraPose? get lastCapturePose => null;
 
   /// Preview width ÷ height in portrait, or `null` before [open].
   double? get previewAspectRatio;

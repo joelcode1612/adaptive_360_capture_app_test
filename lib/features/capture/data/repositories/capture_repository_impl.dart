@@ -270,12 +270,12 @@ class FileCaptureRepository implements CaptureRepository {
     existing.sort(
       (CaptureRecord a, CaptureRecord b) => a.targetId.compareTo(b.targetId),
     );
-    await file.writeAsString(
-      jsonEncode(
-        existing.map((CaptureRecord r) => r.toJson()).toList(growable: false),
-      ),
-      flush: true,
+    final contents = jsonEncode(
+      existing.map((CaptureRecord r) => r.toJson()).toList(growable: false),
     );
+    final temporary = File('${file.path}.partial');
+    await temporary.writeAsString(contents, flush: true);
+    await temporary.rename(file.path);
   }
 
   @override

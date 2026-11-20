@@ -31,6 +31,8 @@ import 'package:adaptive_360_capture_app/features/sphere_capture/data/gallery_sa
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/normalized_jpeg.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/motion_detector.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/motion_freeze_gate.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_station_guard.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/quality/decision_rules.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_projection.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/domain/sphere_target.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/scalars.dart';
@@ -107,6 +109,7 @@ class SphereCaptureController extends ChangeNotifier {
     required PanoramaStitcher stitcher,
     required String stationId,
     required Future<NormalizedJpeg> Function(Uint8List bytes) normalize,
+    Future<QualityDecision> Function(Uint8List jpeg)? photoQuality,
     Stream<Vec3>? motion,
     Stream<Vec3>? angularVelocity,
     PermissionService? permissions,
@@ -132,6 +135,7 @@ class SphereCaptureController extends ChangeNotifier {
        _haptic = haptic ?? HapticFeedback.mediumImpact,
        _clock = clock ?? DateTime.now,
        _normalize = normalize,
+       _photoQuality = photoQuality,
        _export = export ?? _defaultExport,
        _gallery = gallerySaver ?? const GallerySaver(),
        _sessions = sessions,
@@ -153,6 +157,16 @@ class SphereCaptureController extends ChangeNotifier {
   final Future<void> Function() _haptic;
   final DateTime Function() _clock;
   final Future<NormalizedJpeg> Function(Uint8List bytes) _normalize;
+  final Future<QualityDecision> Function(Uint8List jpeg)? _photoQuality;
+  final SphereStationGuard _stationGuard = SphereStationGuard();
+  StreamSubscription<SphereCameraPose>? _trackedPoseSubscription;
+  DateTime? _poseReceivedAt;
+  bool? _lastStationAllowed;
+
+  /// Null for CameraX, since 3DoF cannot measure phone translation.
+  String? get stationWarning =>
+      _camera.trackedPoses == null ? null : _stationGuard.message;
+
   final SphereExporter _export;
   final GallerySaver _gallery;
 
@@ -477,6 +491,9 @@ class SphereCaptureController extends ChangeNotifier {
     // whatever pose a previous, failed attempt happened to record.
     _deviceToWorld = null;
     _startDeviceToWorld = null;
+    _stationGuard.reset();
+    _poseReceivedAt = null;
+    _lastStationAllowed = null;
     _previewReadyAt = null;
     _lastRotationArrivalAt = null;
     _referenceCompleter = Completer<void>();
@@ -498,6 +515,25 @@ class SphereCaptureController extends ChangeNotifier {
       await _ensureSession();
       await _permissions.ensureCapturePermissions();
       await _camera.open();
+      final poseStream = _camera.trackedPoses;
+      if (poseStream != null) {
+        await _trackedPoseSubscription?.cancel();
+        _trackedPoseSubscription = poseStream.listen((pose) {
+          _poseReceivedAt = _clock();
+          _stationGuard.update(position: pose.position, tracking: pose.tracking);
+          final allowed = _stationGuard.canCapture;
+          if (_lastStationAllowed != allowed) {
+            _lastStationAllowed = allowed;
+            if (!allowed) {
+              _holdProgress = 0;
+              _message = _stationGuard.message;
+            } else {
+              _message = 'AR station stable. Point at the next target.';
+            }
+            _notify();
+          }
+        });
+      }
       // The preview must be visible before the reference heading is taken.
       // `open()` only guarantees the platform stream is configured; the
       // texture still has to attach and draw. A reference taken before that
@@ -532,7 +568,10 @@ class SphereCaptureController extends ChangeNotifier {
         const Duration(seconds: 2),
         onTimeout: () {},
       );
-      _phase = SphereCapturePhase.ready;
+      // Restored stations containing all frames must not be reopened as
+      // new capture sessions. They remain eligible for stitching/retry.
+      _phase = capturedCount >= kSphereTargetCount
+          ? SphereCapturePhase.complete : SphereCapturePhase.ready;
       _recomputeGuide();
       if (_startDeviceToWorld == null) {
         _message =
@@ -698,7 +737,11 @@ class SphereCaptureController extends ChangeNotifier {
         // gyroscope (tests, or a device without one) the gate is skipped rather
         // than blocking every capture.
         final frozen = _angularVelocityStream == null || _freezeGate.still;
-        if (_holdProgress >= 1.0 && !_capturing && frozen) {
+        final stationFresh = _poseReceivedAt != null &&
+            now.difference(_poseReceivedAt!) <= const Duration(milliseconds: 650);
+        final stationStable = _camera.trackedPoses == null ||
+            (_stationGuard.canCapture && stationFresh);
+        if (_holdProgress >= 1.0 && !_capturing && frozen && stationStable) {
           unawaited(_capture(active));
         }
       } else if (activeError > exitToleranceDeg) {
@@ -728,12 +771,9 @@ class SphereCaptureController extends ChangeNotifier {
 
   Future<void> _capture(SphereTargetState target) async {
     if (_capturing) return;
-    final device = _deviceToWorld;
-    if (device == null) return;
-    // The evidence must describe the instant the shutter was authorised, not
-    // the instant the JPEG finished encoding: rotation samples keep arriving
-    // during `takePicture`, and reading the live field afterwards would record
-    // an angle the user had already turned away from.
+    if (_deviceToWorld == null) return;
+    // Shutter pose is sampled AFTER the camera flush. ARCore overrides it with
+    // the camera's actual acquisition-time pose, including world position.
     _capturing = true;
     _phase = SphereCapturePhase.capturing;
     _holdProgress = 0;
@@ -751,15 +791,57 @@ class SphereCaptureController extends ChangeNotifier {
       // describes the frame that will be captured rather than the instant the
       // hold completed.
       final errorAtShutter = _activeErrorDeg;
+      final shutterPose = _deviceToWorld;
+      if (shutterPose == null || _activeTargetId != target.spec.targetId ||
+          errorAtShutter > toleranceDeg ||
+          (_angularVelocityStream != null && !_freezeGate.still) ||
+          (_camera.trackedPoses != null &&
+              (!_stationGuard.canCapture || _poseReceivedAt == null ||
+              _clock().difference(_poseReceivedAt!) >
+                  const Duration(milliseconds: 650)))) {
+        _phase = SphereCapturePhase.ready;
+        _message = _stationGuard.message ??
+            'The phone moved while taking the photo. Re-align this target.';
+        return;
+      }
       final raw = await _camera.takePicture();
+      final exactPose = _camera.lastCapturePose;
+      if (_camera.trackedPoses != null) {
+        if (exactPose == null || !exactPose.tracking) {
+          _phase = SphereCapturePhase.ready;
+          _message = 'ARCore did not provide a valid shutter-time camera pose. Retake.';
+          return;
+        }
+        _stationGuard.update(position: exactPose.position, tracking: true);
+        if (!_stationGuard.canCapture) {
+          _phase = SphereCapturePhase.ready;
+          _message = _stationGuard.message;
+          return;
+        }
+      }
       final normalized = await _normalize(raw);
+      String? qualityWarning;
+      final validate = _photoQuality;
+      if (validate != null) {
+        final quality = await validate(normalized.bytes);
+        if (!quality.ok) {
+          _phase = SphereCapturePhase.ready;
+          _message = quality.message;
+          return; // No saved frame, and this target remains available.
+        }
+        if (quality.hasWarning) qualityWarning = quality.message;
+      }
       final path = await _repository.framePath(
         _stationId,
         target.spec.targetId,
       );
       final file = File(path);
       await file.parent.create(recursive: true);
-      await file.writeAsBytes(normalized.bytes, flush: true);
+      // Flush a partial JPEG first; only a complete write becomes the
+      // accepted file. A crash cannot leave an accepted half-written JPEG.
+      final partial = File('$path.partial');
+      await partial.writeAsBytes(normalized.bytes, flush: true);
+      await partial.rename(path);
       final record = CaptureRecord(
         stationId: _stationId,
         targetId: target.spec.targetId,
@@ -770,8 +852,9 @@ class SphereCaptureController extends ChangeNotifier {
         // 3DoF measures no translation, so none is claimed. The position is
         // the sphere centre by definition and the orientation is the sensor
         // quaternion at the shutter.
-        cameraPosition: Vec3.zero,
-        cameraOrientation: device,
+        cameraPosition: exactPose?.position ?? Vec3.zero,
+        cameraOrientation: exactPose?.orientation ?? shutterPose,
+        captureTimestampNs: exactPose?.timestampNs,
         alignmentErrorDeg: errorAtShutter,
         anchored: false,
         imageWidth: normalized.width,
@@ -784,10 +867,6 @@ class SphereCaptureController extends ChangeNotifier {
         toleranceDeg: toleranceDeg,
       );
       await _repository.saveRecord(record);
-      // Mirrored into SQLite after the JPEG and the JSON record exist. A
-      // failure here loses bookkeeping only, never the photograph, so it must
-      // not fail the capture.
-      await _persistFrame(record);
       debugPrint(
         'SPHERE_CAPTURE: target ${target.spec.targetId} saved '
         '${normalized.width}x${normalized.height} '
@@ -804,8 +883,11 @@ class SphereCaptureController extends ChangeNotifier {
       // the adjacent uncaptured direction, so consecutive photographs keep
       // overlapping content for the panorama.
       _lastCapturedDirection = target.spec.direction;
+      // Persist after memory state updated: the last of 38 captures can now
+      // mark the SQLite session complete (previously capturedCount was 37).
+      await _persistFrame(record);
       _recomputeGuide();
-      _message = normalized.warning;
+      _message = qualityWarning ?? normalized.warning;
       // Haptics are a courtesy, not evidence: a device that refuses them must
       // not turn a saved photograph into a reported failure.
       try {
@@ -868,6 +950,7 @@ class SphereCaptureController extends ChangeNotifier {
     if (state == AppLifecycleState.resumed && !_camera.isOpen) {
       try {
         await _camera.open();
+        if (capturedCount > 0) await _camera.lockCaptureSettings();
         _notify();
       } catch (error) {
         _message =
@@ -1304,6 +1387,7 @@ class SphereCaptureController extends ChangeNotifier {
     unawaited(_rotationSubscription?.cancel());
     unawaited(_motionSubscription?.cancel());
     unawaited(_gyroSubscription?.cancel());
+    unawaited(_trackedPoseSubscription?.cancel());
     unawaited(_rotation.stop());
     // Release the locks before closing: the next session must not inherit this
     // room's exposure.

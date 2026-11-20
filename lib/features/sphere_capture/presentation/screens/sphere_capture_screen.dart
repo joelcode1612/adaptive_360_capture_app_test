@@ -7,6 +7,8 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:adaptive_360_capture_app/features/capture_guide/presentation/screens/capture_guide_screen.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/equirectangular_stitcher.dart';
 import 'package:adaptive_360_capture_app/features/sphere_capture/data/jpeg_normalizer.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/data/sphere_jpeg_quality_validator.dart';
+import 'package:adaptive_360_capture_app/features/sphere_capture/platform/arcore_sphere_camera.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/panorama_stitcher.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/application/sitewise_services.dart';
@@ -109,8 +111,13 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
       _startError = null;
     });
     try {
-      final camera = widget.camera ?? PluginSphereCamera();
-      final rotation = widget.rotation ?? NativeRotationSource();
+      // ARCore owns camera + motion together; CameraX cannot run at the
+      // same time. Enable on this experimental branch with sphere_use_arcore.
+      const useArCore = bool.fromEnvironment('sphere_use_arcore');
+      final camera = widget.camera ??
+          (useArCore ? ArCoreSphereCamera() : PluginSphereCamera());
+      final rotation = widget.rotation ??
+          (camera is ArCoreSphereCamera ? camera : NativeRotationSource());
       final repository =
           widget.repository ?? await FileCaptureRepository.create();
       final services = widget.services ?? await SitewiseServices.create();
@@ -120,14 +127,23 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
       // photographs already on disk.
       String stationId;
       if (widget.sessionId != null) {
+        // ARCore's local world is not guaranteed to survive process death.
+        // Never mix a prior session's camera poses with a new ARCore origin.
+        if (camera is ArCoreSphereCamera &&
+            (await repository.loadRecords(widget.sessionId!)).isNotEmpty) {
+          throw StateError('This ARCore station contains earlier photographs '
+              'with an unverified tracking origin. Start a new station; '
+              'the original photographs remain saved.');
+        }
         stationId = widget.sessionId!;
       } else {
         final resumable = await store?.findResumableSession(
           userId: widget.userId,
         );
-        stationId =
-            resumable?.sessionId ??
-            'sphere-${DateTime.now().millisecondsSinceEpoch}';
+        stationId = camera is ArCoreSphereCamera
+            ? 'sphere-${DateTime.now().millisecondsSinceEpoch}'
+            : (resumable?.sessionId ??
+                'sphere-${DateTime.now().millisecondsSinceEpoch}');
       }
       final controller = SphereCaptureController(
         rotation: rotation,
@@ -139,6 +155,8 @@ class _SphereCaptureScreenState extends State<SphereCaptureScreen>
         // defaulted inside the controller: that keeps the controller — and its
         // tests — free of the native stitching library.
         normalize: const JpegNormalizer().normalize,
+        // Validate each actual JPEG before it becomes part of the station.
+        photoQuality: const SphereJpegQualityValidator().validate,
         sessions: store,
         sync: services.sync,
         userId: widget.userId,
