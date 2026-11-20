@@ -58,7 +58,7 @@ class ArCoreSphereCamera implements SphereCamera, RotationSource {
     if (event.type != ArCoreEventType.pose || sample == null) return;
     final pose = SphereCameraPose(
       position: sample.position,
-      orientation: sample.raw.orientation,
+      orientation: sample.orientation,
       tracking: sample.tracking == TrackingState.tracking &&
           !sample.trackingTransition,
       timestampNs: sample.raw.timestampNs,
@@ -142,7 +142,7 @@ class ArCoreSphereCamera implements SphereCamera, RotationSource {
     }
     _lastShot = SphereCameraPose(
       position: pose.position,
-      orientation: pose.orientation,
+      orientation: pose.captureWorld,
       tracking: true,
       timestampNs: pose.timestampNs,
     );
