@@ -697,7 +697,11 @@ class SphereCaptureController extends ChangeNotifier {
         // sample and still skews a vertical wall, so both are required. With no
         // gyroscope (tests, or a device without one) the gate is skipped rather
         // than blocking every capture.
-        final frozen = _angularVelocityStream == null || _freezeGate.still;
+        // SITEWISE_SEAM_POSE_INTEGRITY_20261121: angular stillness is not
+        // evidence of a stationary viewpoint. Pause auto-shutter when the
+        // accelerometer's motion window still reports translational movement.
+        final frozen =
+            (_angularVelocityStream == null || _freezeGate.still) && !_moving;
         if (_holdProgress >= 1.0 && !_capturing && frozen) {
           unawaited(_capture(active));
         }
@@ -728,12 +732,10 @@ class SphereCaptureController extends ChangeNotifier {
 
   Future<void> _capture(SphereTargetState target) async {
     if (_capturing) return;
-    final device = _deviceToWorld;
-    if (device == null) return;
-    // The evidence must describe the instant the shutter was authorised, not
-    // the instant the JPEG finished encoding: rotation samples keep arriving
-    // during `takePicture`, and reading the live field afterwards would record
-    // an angle the user had already turned away from.
+    if (_deviceToWorld == null) return;
+    // SITEWISE_SEAM_POSE_INTEGRITY_20261121: the pose must be sampled near
+    // the real shutter request, not before the CameraX queue-settling delay.
+    // Captured photos retain an immutable pose even while sensors keep ticking.
     _capturing = true;
     _phase = SphereCapturePhase.capturing;
     _holdProgress = 0;
@@ -747,10 +749,22 @@ class SphereCaptureController extends ChangeNotifier {
       // half of the double-image overlay. 150 ms is longer than the buffer
       // queue's latency and short enough that the shutter does not feel slow.
       await Future<void>.delayed(const Duration(milliseconds: 150));
-      // Read the pose *after* the flush, immediately before the shutter, so it
-      // describes the frame that will be captured rather than the instant the
-      // hold completed.
+      // SITEWISE_SEAM_POSE_INTEGRITY_20261121: refresh pose AFTER the
+      // 150ms camera queue settle, at the moment the still is requested.
+      // Earlier code only refreshed the error and recorded a stale quaternion,
+      // creating a systematic mismatch between projection and JPEG content.
+      final shutterDevice = _deviceToWorld;
+      if (shutterDevice == null ||
+          _activeTargetId != target.spec.targetId ||
+          _activeErrorDeg > toleranceDeg ||
+          _moving ||
+          (_angularVelocityStream != null && !_freezeGate.still)) {
+        _phase = SphereCapturePhase.ready;
+        _message = 'Phone moved before the shutter. Hold still and retry.';
+        return; // Keep the target uncaptured; the finally block resets state.
+      }
       final errorAtShutter = _activeErrorDeg;
+      final shutterAt = _clock();
       final raw = await _camera.takePicture();
       final normalized = await _normalize(raw);
       final path = await _repository.framePath(
@@ -764,14 +778,14 @@ class SphereCaptureController extends ChangeNotifier {
         stationId: _stationId,
         targetId: target.spec.targetId,
         imagePath: path,
-        capturedAt: _clock(),
+        capturedAt: shutterAt,
         targetYawDegrees: target.spec.yawDeg,
         targetPitchDegrees: target.spec.pitchDeg,
         // 3DoF measures no translation, so none is claimed. The position is
         // the sphere centre by definition and the orientation is the sensor
         // quaternion at the shutter.
         cameraPosition: Vec3.zero,
-        cameraOrientation: device,
+        cameraOrientation: shutterDevice,
         alignmentErrorDeg: errorAtShutter,
         anchored: false,
         imageWidth: normalized.width,

@@ -4,7 +4,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/application/panorama_sync_service.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/data/cloud/sitewise_auth.dart';
-import 'package:adaptive_360_capture_app/features/sitewise_sync/data/cloud/supabase_panorama_gateway.dart';
+import 'package:adaptive_360_capture_app/core/config/sitewise_environment.dart';
+import 'package:adaptive_360_capture_app/features/sitewise_sync/data/cloud/fastapi_panorama_gateway.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/data/local/capture_session_store.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/data/local/legacy_session_importer.dart';
 import 'package:adaptive_360_capture_app/features/sitewise_sync/data/local/sitewise_database.dart';
@@ -66,10 +67,17 @@ class SitewiseServices {
     try {
       final database = await SitewiseDatabase.open();
       store = SqliteCaptureSessionStore(database);
-      if (client != null) {
+      // Only the backend writes protected panorama metadata and Storage bytes.
+      // Without an API URL, keep capturing/stitching offline; do not silently
+      // fall back to the legacy direct `public.pano_jobs` upload path.
+      if (client != null && SitewiseEnvironment.apiBaseUrl.trim().isNotEmpty) {
+        final apiUri = Uri.tryParse(SitewiseEnvironment.apiBaseUrl.trim());
+        if (apiUri == null || !apiUri.hasScheme || apiUri.host.isEmpty) {
+          throw StateError('Invalid SITEWISE_API_BASE_URL');
+        }
         sync = PanoramaSyncService(
           store: store,
-          gateway: SupabasePanoramaGateway(client),
+          gateway: FastApiPanoramaGateway(baseUri: apiUri, supabase: client),
           auth: auth,
         );
       }

@@ -15,9 +15,11 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capt
 /// Page 4's Start Capture enters the existing capture engine immediately.
 /// When opened as help during a capture, the same final action returns to it.
 class CaptureGuideScreen extends StatefulWidget {
-  const CaptureGuideScreen({super.key, this.showStartAction = true});
+  const CaptureGuideScreen({super.key, this.showStartAction = true, this.propertyId});
 
   final bool showStartAction;
+  /// Property context supplied by SiteWise navigation.
+  final int? propertyId;
 
   @override
   State<CaptureGuideScreen> createState() => _CaptureGuideScreenState();
@@ -51,7 +53,9 @@ class _CaptureGuideScreenState extends State<CaptureGuideScreen> {
     // engine, frame persistence, resume and stitch paths remain unchanged.
     Navigator.of(context).pushReplacement(
       MaterialPageRoute<void>(
-        builder: (_) => const SphereCaptureScreen(autoStart: true),
+        builder: (_) => SphereCaptureScreen(
+          autoStart: true, propertyId: widget.propertyId,
+        ),
       ),
     );
   }

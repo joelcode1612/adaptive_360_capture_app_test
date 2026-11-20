@@ -485,7 +485,9 @@ int refineSeams({
       final prev = row + x - 1;
       final ownerPrev = label[prev] == 0 ? bestFrame[prev] : secondFrame[prev];
       final ownerHere = label[i] == 0 ? bestFrame[i] : secondFrame[i];
-      if (ownerPrev == ownerHere) continue;
+      if (ownerPrev < 0 || ownerHere < 0 || ownerPrev == ownerHere) {
+        continue;
+      }
       // A boundary runs between `prev` and `i`.
       if (secondWeight[prev] <= minWeight || secondWeight[i] <= minWeight) {
         continue;
@@ -498,6 +500,9 @@ int refineSeams({
         bestFrame: bestFrame,
         secondFrame: secondFrame,
         boundary: x,
+        leftOwner: ownerPrev,
+        rightOwner: ownerHere,
+        minWeight: minWeight,
         bestWeight: bestWeight,
         secondWeight: secondWeight,
         bestColour: bestColour,
@@ -515,6 +520,9 @@ int _tryShiftBoundary({
   required int height,
   required int rowStart,
   required int boundary,
+  required int leftOwner,
+  required int rightOwner,
+  required double minWeight,
   required Int16List bestFrame,
   required Int16List secondFrame,
   required Float32List bestWeight,
@@ -522,6 +530,14 @@ int _tryShiftBoundary({
   required Uint8List bestColour,
   required Uint8List secondColour,
 }) {
+  // SITEWISE_SEAM_POSE_INTEGRITY_20261121: `best` and `second` are
+  // per-pixel RANKS, not stable photographs. Blindly toggling the label across
+  // a 2–8px seam shift can replace a wardrobe with an unrelated third frame.
+  // Validate ownership by actual physical frame ID at each candidate pixel.
+  int ownerAt(int i) => label[i] == 0 ? bestFrame[i] : secondFrame[i];
+  bool supports(int i, int frame) =>
+      (bestFrame[i] == frame && bestWeight[i] > minWeight) ||
+      (secondFrame[i] == frame && secondWeight[i] > minWeight);
   final current = _seamCostAt(
     rowStart: rowStart,
     position: boundary,
@@ -541,14 +557,19 @@ int _tryShiftBoundary({
     final target = boundary + shift;
     if (target < 1 || target >= width) continue;
 
-    // Sampling penalty for every pixel that would change owner.
-    var sampling = 0.0;
-    var blocked = false;
+    // Shift only across an overlap containing the SAME two physical
+    // photographs. The rank order may swap, but a seam shift must not invent
+    // ownership of an unrelated frame or cross an uncovered region.
+    final wantedOwner = shift > 0 ? leftOwner : rightOwner;
+    final displacedOwner = shift > 0 ? rightOwner : leftOwner;
     final from = shift > 0 ? boundary : target;
     final to = shift > 0 ? target : boundary;
-    for (var p = from; p < to; p++) {
+    var sampling = 0.0;
+    var blocked = !supports(rowStart + target - 1, leftOwner) ||
+        !supports(rowStart + target, rightOwner);
+    for (var p = from; p < to && !blocked; p++) {
       final i = rowStart + p;
-      if (secondWeight[i] <= 0) {
+      if (ownerAt(i) != displacedOwner || !supports(i, wantedOwner)) {
         blocked = true;
         break;
       }
@@ -581,9 +602,17 @@ int _tryShiftBoundary({
   final target = boundary + bestShift;
   final from = bestShift > 0 ? boundary : target;
   final to = bestShift > 0 ? target : boundary;
+  final assignedOwner = bestShift > 0 ? leftOwner : rightOwner;
   for (var p = from; p < to; p++) {
     final i = rowStart + p;
-    label[i] = label[i] == 0 ? 1 : 0;
+    // Resolve label from the physical frame, not from the previous rank.
+    // Every pixel was checked by `supports` during the candidate search.
+    if (bestFrame[i] == assignedOwner && bestWeight[i] > minWeight) {
+      label[i] = 0;
+    } else if (secondFrame[i] == assignedOwner &&
+        secondWeight[i] > minWeight) {
+      label[i] = 1;
+    }
   }
   // `bestSampling` is computed to keep the trade explicit at the call site; the
   // decision has already been made on it.

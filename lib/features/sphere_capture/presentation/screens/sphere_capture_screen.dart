@@ -1253,9 +1253,9 @@ class _CloudStatusState extends State<_CloudStatus> {
       final services = widget.services;
       if (services == null || !services.canSync) {
         return const Text(
-          'Cloud sync is not configured in this build, so the panorama stays on '
-          'this device. Pass the Supabase URL and publishable key at build time '
-          'to enable uploads.',
+          'Cloud upload needs the Supabase URL, publishable key and '
+          'SITEWISE_API_BASE_URL at build time. The panorama remains safely '
+          'on this device until upload is configured.',
           textAlign: TextAlign.center,
           style: TextStyle(
             color: CaptureColors.mutedOnDark,

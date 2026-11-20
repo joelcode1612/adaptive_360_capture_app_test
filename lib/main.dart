@@ -83,6 +83,9 @@ class VirtualTourApp extends StatelessWidget {
 class CaptureLauncher extends StatelessWidget {
   const CaptureLauncher({super.key});
 
+  // Debug only. Production navigation supplies an authorized property ID.
+  static const int devPropertyId = int.fromEnvironment('SITEWISE_PROPERTY_ID');
+
   @override
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: SiteWiseColors.paper,
@@ -104,7 +107,11 @@ class CaptureLauncher extends StatelessWidget {
             // reads.
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
-                builder: (_) => const CaptureGuideScreen(),
+                builder: (_) => CaptureGuideScreen(
+                  propertyId: kDebugMode && devPropertyId > 0
+                      ? devPropertyId
+                      : null,
+                ),
               ),
             ),
           ),

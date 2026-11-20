@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     max_capture_count: int = Field(default=30, ge=1, le=500)
     cors_origins: list[AnyHttpUrl] = []
     allow_development_identity: bool = False
+    # Server-only credentials. Never include service role in Flutter.
+    supabase_url: str = ''
+    supabase_anon_key: str = ''
+    supabase_service_role_key: str = ''
+    panorama_bucket: str = 'property-panoramas' 
 
 
 @lru_cache

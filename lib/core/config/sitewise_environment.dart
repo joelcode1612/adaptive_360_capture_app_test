@@ -25,6 +25,12 @@
 library;
 
 abstract final class SitewiseEnvironment {
+  /// Backend API used for authenticated panorama uploads. Empty = offline only.
+  /// Example physical device (with adb reverse): http://127.0.0.1:8090
+  static const String apiBaseUrl = String.fromEnvironment(
+    'SITEWISE_API_BASE_URL',
+  );
+
   /// `https://<project>.supabase.co`, or empty when unset.
   static const String supabaseUrl = String.fromEnvironment(
     'SITEWISE_SUPABASE_URL',
