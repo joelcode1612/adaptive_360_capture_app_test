@@ -105,6 +105,13 @@ abstract class SphereCamera {
 class PluginSphereCamera implements SphereCamera {
   CameraController? _controller;
 
+  // CameraX has orientation-only sensors; no 6DoF tracking pose.
+  @override
+  Stream<SphereCameraPose>? get trackedPoses => null;
+
+  @override
+  SphereCameraPose? get lastCapturePose => null;
+
   @override
   bool get isOpen => _controller?.value.isInitialized ?? false;
 

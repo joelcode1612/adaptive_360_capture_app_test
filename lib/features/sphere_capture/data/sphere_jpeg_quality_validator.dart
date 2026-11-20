@@ -12,9 +12,12 @@ class SphereJpegQualityValidator {
   const SphereJpegQualityValidator();
 
   /// Camera/device-specific; calibrate against actual sharp and blurred photos.
-  static const double minSharpness = double.fromEnvironment(
-    'sphere_min_laplacian_variance', defaultValue: 25,
-  );
+  static final double minSharpness = double.tryParse(
+    const String.fromEnvironment(
+      'sphere_min_laplacian_variance',
+      defaultValue: '25',
+    ),
+  ) ?? 25.0;
 
   Future<QualityDecision> validate(Uint8List jpeg) async {
     cv.Mat? gray;
@@ -45,7 +48,7 @@ class SphereJpegQualityValidator {
       // analysis runs at quarter decode and includes flat walls and ceilings.
       return decideQuality(
         stats,
-        const QualityThresholds(
+        QualityThresholds(
           darkMean: 36,
           brightMean: 229,
           saturatedShare: 0.32,

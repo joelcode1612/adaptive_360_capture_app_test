@@ -628,12 +628,6 @@ double _outputDelta(Uint8List rgb, int a, int b) =>
         (rgb[a * 3 + 2] - rgb[b * 3 + 2]).abs()) /
     3.0;
 
-double _colourDelta(Uint8List a, Uint8List b, int i) =>
-    ((a[i * 3] - b[i * 3]).abs() +
-        (a[i * 3 + 1] - b[i * 3 + 1]).abs() +
-        (a[i * 3 + 2] - b[i * 3 + 2]).abs()) /
-    3.0;
-
 void _writeBestOnly({
   required Uint8List output,
   required int count,

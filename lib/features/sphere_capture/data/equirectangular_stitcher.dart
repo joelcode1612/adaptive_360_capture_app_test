@@ -200,10 +200,22 @@ const bool kSphereStitchLog = bool.fromEnvironment('sphere_stitch_log');
 /// Evaluate seam metrics with real-device fixtures before enabling by default.
 const bool kSphereStrictSeamIntegrity =
     bool.fromEnvironment('sphere_strict_seam_integrity');
-const double kSphereMaxSeamDiscontinuity =
-    double.fromEnvironment('sphere_max_seam_discontinuity', defaultValue: 16);
-const double kSphereMaxGhostFraction =
-    double.fromEnvironment('sphere_max_ghost_fraction', defaultValue: 0.04);
+final double kSphereMaxSeamDiscontinuity =
+    double.tryParse(
+      const String.fromEnvironment(
+        'sphere_max_seam_discontinuity',
+        defaultValue: '16',
+      ),
+    ) ??
+    16.0;
+final double kSphereMaxGhostFraction =
+    double.tryParse(
+      const String.fromEnvironment(
+        'sphere_max_ghost_fraction',
+        defaultValue: '0.04',
+      ),
+    ) ??
+    0.04;
 
 /// Opt-in strict acceptance: refuse to advertise a 100% photographed panorama
 /// if even one projected pixel required synthetic gap fill. Does not remove

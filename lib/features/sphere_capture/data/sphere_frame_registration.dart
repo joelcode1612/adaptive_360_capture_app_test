@@ -631,8 +631,12 @@ SphereRegistrationOutcome registerSphereFrames({
       for (final p in neighbours[i]) {
         final other = pairs[p].$1 == i ? pairs[p].$2 : pairs[p].$1;
         final candidate = matches[p];
-        if (other >= i || projections[other] == null || candidate == null ||
-            candidate.points.length < 24) continue;
+        if (other >= i ||
+            projections[other] == null ||
+            candidate == null ||
+            candidate.points.length < 24) {
+          continue;
+        }
         if (candidate.points.length > largestInliers) {
           largestInliers = candidate.points.length;
           chosen = p;
